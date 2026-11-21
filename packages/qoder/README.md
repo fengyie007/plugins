@@ -433,8 +433,11 @@ id's first 16 characters, so only the volume serial decides it.
   `<cosyHome>/magpie-context.json`, or `COSY_CONTEXT_JSON` names another
   file. Without it those fields are left empty, as a plugin cannot see the
   IDE's editor. The IDE's system prompt is served to its worker, not stored
-  in its binary, so it cannot be collected: pass `-SystemPromptFile` to the
-  script with one you captured to have it sent verbatim.
+  in its binary, so it cannot be collected: pass
+  `-FromCapture <a captured request body>` and the script takes the prompt
+  that request carried (decoding the `Encode=1` body itself) and rewrites its
+  `<user_info>` with this machine's OS, IDE, workspace and languages; or
+  `-SystemPromptFile` with the text alone.
 - Images are taken: a `data:` URL is first PUT to the deployment's own
   `/algo/api/v2/image/upload` (multipart, one `file` part, the envelope
   signing the body's *length*) and the url it answers is named in the
