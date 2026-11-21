@@ -370,7 +370,7 @@ It follows Qoder IDE 1.38.0's own rules for that setting:
 The rules come from Qoder IDE's code. This plugin has not been tried with a
 dedicated account.
 
-#### Lingma 1.0 dedicated domains (since 0.2.56; the 通义灵码 IDE plugin, a derived machine id, the domain's own model list, its body shape and its images since 0.2.72)
+#### Lingma 1.0 dedicated domains (since 0.2.56; the 通义灵码 IDE plugin, a derived machine id, the domain's own model list, its body shape and its images since 0.2.72, and the IDE's workspace facts since 0.2.73)
 
 A Lingma 1.0 domain has no device flow and takes no console PAT. The IDE
 signs in to it through its own language server. So the plugin uses the
@@ -426,6 +426,15 @@ id's first 16 characters, so only the volume serial decides it.
   `max_tokens` above the model's ceiling is clamped as on Qoder; the
   workspace fields (`workspaceLanguages`, `activeFilePath`, `code_language`)
   are left empty, as a plugin cannot know the IDE's.
+- The IDE's workspace facts (`workspaceLanguages`, `activeFilePath`,
+  `code_language`) come from `magpie-context.json`, which
+  [`collect_ide_context.ps1`](collect_ide_context.ps1) writes on the IDE's
+  machine (run it there once; it only reads what the IDE left on disk):
+  `<cosyHome>/magpie-context.json`, or `COSY_CONTEXT_JSON` names another
+  file. Without it those fields are left empty, as a plugin cannot see the
+  IDE's editor. The IDE's system prompt is served to its worker, not stored
+  in its binary, so it cannot be collected: pass `-SystemPromptFile` to the
+  script with one you captured to have it sent verbatim.
 - Images are taken: a `data:` URL is first PUT to the deployment's own
   `/algo/api/v2/image/upload` (multipart, one `file` part, the envelope
   signing the body's *length*) and the url it answers is named in the

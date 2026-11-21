@@ -358,24 +358,26 @@ test("its models are the IDE's, and usage and check-in ask the domain nothing", 
   expect(seen).toEqual([])
 })
 
-// plugins#822: a max_tokens above the model's ceiling, which Qoder says
-// behind "Error in upstream response", is asked again once at that ceiling
-// on a Lingma domain too, before the next model is tried
-test("a Lingma domain's max_tokens range refusal is asked again at the ceiling it named", async () => {
-  _internal.LEARNED_CAPS.clear()
-  const RANGE = frame({ message: "Error in upstream response", details: JSON.stringify({ error: { message: "Range of max_tokens should be [1, 131072]" } }) }, 400)
-  const maxOf = (s) => JSON.parse(_internal.decodeBody(s.body)).parameters.max_tokens
-  route = (at, { body }) => {
-    if (at !== HOST + CHAT) return new Response("", { status: 404 })
-    return sse(JSON.parse(_internal.decodeBody(body)).parameters.max_tokens > 131072 ? RANGE : OK)
-  }
-  const s = store(signedIn())
+// The capture is the shape: parameters is null (the IDE leaves the model's
+// defaults alone), and the workspace fields are the collector's.
+test("the body carries the capture's own values, and the workspace the collector wrote", async () => {
+  ideCache(cosy, ACCOUNT())
+  writeFileSync(
+    join(cosy, _internal.LINGMA_CONTEXT_FILE),
+    JSON.stringify({ workspaceLanguages: ["shell", "sql"], activeFilePath: "D:\work\README.md", codeLanguage: "Markdown", systemPrompt: "PROMPT FROM THE DEPLOYMENT" }),
+  )
+  route = (at) => (at === HOST + CHAT ? sse(OK) : new Response("", { status: 404 }))
+  const s = store(signedIn({ lingmaRoot: cosy }))
   const opts = await (await QoderCNAuthPlugin({ client: s.client })).auth.loader(s.get)
-  const res = await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ ...ask, max_tokens: 384000 }) })
-  expect(res.status).toBe(200)
-  expect(chats().map(sentModel)).toEqual(["qmodel_latest", "qmodel_latest"])
-  expect(chats().map(maxOf)).toEqual([384000, 131072])
-  _internal.LEARNED_CAPS.clear()
+  expect((await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ ...ask, max_tokens: 384000 }) })).status).toBe(200)
+  const body = JSON.parse(_internal.decodeBody(chats()[0].body))
+  expect(body.parameters).toBe(null)
+  expect(body.code_language).toBe("Markdown")
+  expect(body.chat_context.workspaceLanguages).toEqual(["shell", "sql"])
+  expect(body.chat_context.activeFilePath).toBe("D:\work\README.md")
+  // the prompt the collector captured is the one the turns are given
+  expect(body.messages[0].role).toBe("system")
+  expect(body.messages[0].content).toContain("PROMPT FROM THE DEPLOYMENT")
 })
 
 // The deployment reads an image from its own file service: the chat names a

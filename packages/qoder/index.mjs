@@ -648,6 +648,7 @@ function lingmaAccount(site, origin, got) {
     deviceRefresh: "",
     dedicated: host,
     lingma: true,
+    lingmaRoot: got.root,
     ...(got.version ? { lingmaVersion: got.version } : {}),
     ...(got.userType ? { lingmaUserType: got.userType } : {}),
   }
@@ -810,6 +811,36 @@ function lingmaImageLines(images) {
   return images.map((x) => (x.name ? `#image:${x.name}` : "")).filter(Boolean)
 }
 
+// LINGMA_CONTEXT_FILE is what collect_ide_context.ps1 writes on the IDE's
+// machine: the workspace's languages, its active file and code language, and
+// (when the deployment's own system prompt was captured) that prompt. It is
+// read from COSY_CONTEXT_JSON, else beside the cache the account came from.
+const LINGMA_CONTEXT_FILE = "magpie-context.json"
+const LINGMA_CONTEXTS = new Map()
+
+async function lingmaContext(account) {
+  const said = String(process.env.COSY_CONTEXT_JSON ?? "").trim()
+  const path = said || (account?.lingmaRoot ? join(account.lingmaRoot, LINGMA_CONTEXT_FILE) : "")
+  if (!path) return {}
+  let mtime = 0
+  try {
+    mtime = (await stat(path)).mtimeMs
+  } catch {
+    return {}
+  }
+  const hit = LINGMA_CONTEXTS.get(path)
+  if (hit && hit.mtime === mtime) return hit.ctx
+  let ctx = {}
+  try {
+    const raw = JSON.parse(await readFile(path, "utf8"))
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) ctx = raw
+  } catch {
+    return {}
+  }
+  LINGMA_CONTEXTS.set(path, { mtime, ctx })
+  return ctx
+}
+
 // lingmaBody is agent_chat_generation in the shape a Lingma 1.0 deployment
 // takes it (2026-11-20 capture): chat_context/chat_prompt/image_urls beside
 // the turns, is_reply/is_retry, source/version/chat_task, the IDE's own
@@ -817,22 +848,23 @@ function lingmaImageLines(images) {
 // kept (the capture says null, the model's own defaults); the rest of the
 // values the IDE sends but a plugin cannot know (workspace languages, the
 // active file, code language) are left empty.
-function lingmaBody(chat, m, named, site, images = []) {
+function lingmaBody(chat, m, named, site, images = [], ctx = {}) {
   const turns = lingmaMessages(chat.messages)
   const said = (() => {
     for (let i = turns.length - 1; i >= 0; i--) if (turns[i].role === "user") return turns[i].content
     return ""
   })()
   const system = (chat.messages ?? []).filter((x) => x.role === "system" || x.role === "developer").map((x) => textOf(x.content)).filter(Boolean).join("\n\n")
-  const baseSystem = site?.systemPrompt ?? QODER_SYS
+  // the deployment's own prompt, when the collector captured it: the IDE's is
+  // served to its worker, not carried in the binary (no "You are Lingma" in
+  // either exe), so it can only be injected, never rebuilt here
+  const baseSystem = String(ctx?.systemPrompt ?? "").trim() || site?.systemPrompt || QODER_SYS
   const sysText = system ? baseSystem + "\n\n" + system : baseSystem
   const budget = chat.max_completion_tokens || chat.max_tokens || 0
   const [thinking] = effortFor(chat.reasoning_effort, m, typeof budget === "number" ? budget : 0)
-  const asked = chat.max_completion_tokens || chat.max_tokens || 32000
-  const cap = outputCap(m)
-  const params = { enable_thinking: thinking, max_tokens: cap > 0 && asked > cap ? cap : asked }
-  const window = windowFor(chat, m, params.max_tokens)
-  if (window > 0) params.context_length = window
+  const languages = Array.isArray(ctx?.workspaceLanguages) ? ctx.workspaceLanguages.filter((x) => typeof x === "string" && x.trim()) : []
+  const activeFilePath = typeof ctx?.activeFilePath === "string" ? ctx.activeFilePath : ""
+  const codeLanguage = typeof ctx?.codeLanguage === "string" ? ctx.codeLanguage : ""
   const lines = lingmaImageLines(images)
   const urls = images.map((x) => x.url)
   const prompt = lines.length ? `\n用户上下文:\n\n${lines.join("\n")}\n\n\n\n问题：\n${said}` : ""
@@ -845,12 +877,12 @@ function lingmaBody(chat, m, named, site, images = []) {
     chat_task: "FREE_INPUT",
     chat_context: {
       text: said ? said + "\n" : "",
-      workspaceLanguages: [],
+      workspaceLanguages: languages,
       language: "",
       localeLang: "zh",
       preferredLanguage: "zh",
       features: [],
-      activeFilePath: "",
+      activeFilePath,
       chatPrompt: prompt,
       imageUrls: urls.length ? urls : null,
     },
@@ -858,11 +890,12 @@ function lingmaBody(chat, m, named, site, images = []) {
     is_reply: false,
     is_retry: false,
     session_id: sessionOf(chat, named),
-    code_language: "",
+    code_language: codeLanguage,
     source: 1,
     version: "3",
     chat_prompt: prompt,
-    parameters: params,
+    // the capture's own value: the IDE leaves the model's defaults alone
+    parameters: null,
     aliyun_user_type: site?.lingmaUserType ?? "",
     session_type: site?.sessionType ?? "assistant",
     agent_id: "agent_chat",
@@ -4260,6 +4293,7 @@ const makePlugin = (site) => async ({ client }) => {
     const tools = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function") : []
     // the chat's images go up once, before any model is asked: a retry on the
     // next model names the same urls
+    const ctx = await lingmaContext(cred)
     let images = []
     if (chatImages(chat).length) {
       try {
@@ -4276,7 +4310,7 @@ const makePlugin = (site) => async ({ client }) => {
       const url = s.api + CHAT_PATH
       let body
       try {
-        body = lingmaBody(chat, m, named, s, images)
+        body = lingmaBody(chat, m, named, s, images, ctx)
       } catch (e) {
         return errorResponse({ status: 400, message: e?.message ?? String(e) })
       }
@@ -4628,4 +4662,4 @@ export async function QwenWorkEnterpriseAuthPlugin({ client }) {
 export const protocol = { makePlugin, deviceSignIn, openapi, siteOf }
 
 // for tests
-export const _internal = { spentOf, OUTPUT_CAPS, LEARNED_CAPS, outputCap, fetchListing, accountIdentity, deviceRefreshBody, qwenworkClientHeaders, freeView, maskPhone, phoneLabelOf, realEmailOf, chatHeaders, machineOS, machineHostname, cosyHeaders, typedUnions, Splitter, campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, dedicatedOrigin, dedicatedHost, dedicatedSite, dedicatedSignIn, lingmaRoots, lingmaDecode, lingmaSite, lingmaHeaders, lingmaListing, lingmaJsonHeaders, LINGMA_MODELS_PATH, lingmaUploadImage, lingmaImages, lingmaImageUrls, chatImages, dataUrlBytes, LINGMA_UPLOAD_PATH, lingmaBody, lingmaMessages, lingmaImageLines, lingmaDerivedMachineIds, lingmaMachineIdFrom, lingmaAddSystemMark, lingmaVersion, lingmaMacs, fitLen, LINGMA_MODELS, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, kimiModel, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }
+export const _internal = { spentOf, OUTPUT_CAPS, LEARNED_CAPS, outputCap, fetchListing, accountIdentity, deviceRefreshBody, qwenworkClientHeaders, freeView, maskPhone, phoneLabelOf, realEmailOf, chatHeaders, machineOS, machineHostname, cosyHeaders, typedUnions, Splitter, campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, dedicatedOrigin, dedicatedHost, dedicatedSite, dedicatedSignIn, lingmaRoots, lingmaDecode, lingmaSite, lingmaHeaders, lingmaListing, lingmaJsonHeaders, LINGMA_MODELS_PATH, lingmaContext, LINGMA_CONTEXT_FILE, lingmaUploadImage, lingmaImages, lingmaImageUrls, chatImages, dataUrlBytes, LINGMA_UPLOAD_PATH, lingmaBody, lingmaMessages, lingmaImageLines, lingmaDerivedMachineIds, lingmaMachineIdFrom, lingmaAddSystemMark, lingmaVersion, lingmaMacs, fitLen, LINGMA_MODELS, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, kimiModel, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }
