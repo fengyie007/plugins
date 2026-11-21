@@ -510,3 +510,37 @@ test("with no captured prompt, the chat names the IDE the collector found, and n
   expect(sys).toContain("D:\work\p")
   expect(sys).toContain("shell, SQL, etc.")
 })
+
+// The deployment streams OpenAI chunks inside its envelope: content deltas,
+// native tool calls (the id on the first, fragments after), a usage chunk,
+// [DONE] and an event:finish tail. Every piece is read as the capture has it.
+test("a Lingma stream's content, native tool calls and tail are all read", async () => {
+  const chunk = (delta, finish_reason, usage) =>
+    frame({ id: "chatcmpl-x", object: "chat.completion.chunk", created: 1, model: "glm-latest-coder", choices: [{ index: 0, delta, finish_reason: finish_reason ?? null }], ...(usage ? { usage } : {}) })
+  const done = "data:" + JSON.stringify({ headers: { "Content-Type": ["application/json"] }, body: "[DONE]", statusCodeValue: 200, statusCode: "OK" }) + "\n\n"
+  const tail = "event:finish\ndata:" + JSON.stringify({ firstTokenDuration: 948, totalDuration: 1955, serverDuration: 64 }) + "\n\n"
+  const reply =
+    chunk({ role: "assistant", content: "" }) +
+    chunk({ content: "我来读取文件。" }) +
+    chunk({ content: "", tool_calls: [{ id: "call_2b5e227f92104afabb783764", function: { arguments: '{"file', name: "read_file" }, type: "function", index: 0 }] }) +
+    chunk({ content: "", tool_calls: [{ id: "", function: { arguments: '_path": "a.txt"}' }, type: "function", index: 0 }] }) +
+    chunk({}, "tool_calls") +
+    chunk({}, null, { completion_tokens: 7, prompt_tokens: 10, total_tokens: 17 }) +
+    done +
+    tail
+  route = (at) => (at === HOST + CHAT ? new Response(reply, { headers: { "Content-Type": "text/event-stream" } }) : new Response("", { status: 404 }))
+  const s = store(signedIn())
+  const opts = await (await QoderCNAuthPlugin({ client: s.client })).auth.loader(s.get)
+  const req = {
+    model: "qmodel_latest",
+    messages: [{ role: "user", content: "读取 a.txt" }],
+    tools: [{ type: "function", function: { name: "read_file", parameters: { type: "object", properties: {} } } }],
+  }
+  const res = await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(req) })
+  expect(res.status).toBe(200)
+  const out = await res.json()
+  expect(out.choices[0].message.content).toContain("我来读取文件")
+  expect(out.choices[0].message.tool_calls?.[0]).toMatchObject({ type: "function", function: { name: "read_file", arguments: '{"file_path": "a.txt"}' } })
+  // and the request named the tool as the deployment takes them
+  expect(JSON.parse(_internal.decodeBody(chats()[0].body)).tools[0].function.name).toBe("read_file")
+})
