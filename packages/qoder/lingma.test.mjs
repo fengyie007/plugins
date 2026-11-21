@@ -570,3 +570,32 @@ test("a private deployment's token in access_token is taken when security_oauth_
   expect(none.reason).toContain("some_field")
   expect(none.reason).not.toContain("secret-value")
 })
+
+// A private deployment issues no bearer token: its cache holds the account's
+// RSA-wrapped key and the blob that key opens, and every call repeats that
+// pair (measured: one pair across 25 requests).
+test("a cache with no token signs in on its key and info pair, and repeats it", async () => {
+  const KEY = "nbNZqVHezARUeuFh238l4LyYmWTwNA86EmDtSGyv" + "A".repeat(129)
+  const INFO = "NhlRH3ZSVzODneWfz0d+iQW1sojTV0nt1doLW/9s" + "B".repeat(729)
+  ideCache(cosy, ACCOUNT({ security_oauth_token: "", access_token: "", refresh_token: "", expire_time: 0, key: KEY, encrypt_user_info: INFO, on_premise: "true" }))
+  route = (at) => (at === HOST + CHAT ? sse(OK) : new Response("", { status: 404 }))
+
+  const hooks = await QoderCNAuthPlugin({ client: store().client })
+  const cred = await (await lingmaMethod(hooks).authorize({ dedicated: HOST })).callback()
+  expect(cred.lingmaKey).toBe(KEY)
+  expect(cred.lingmaInfo).toBe(INFO)
+  // nothing to expire, so nothing ever asks to sign in again
+  expect(cred.expires).toBe(0)
+
+  // magpie stores what the sign-in answered as the account it later loads
+  const s = store({ ...cred, type: "oauth" })
+  const opts = await (await QoderCNAuthPlugin({ client: s.client })).auth.loader(s.get)
+  const res = await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(ask) })
+  if (res.status !== 200) throw new Error(`status ${res.status}: ${await res.text()}`)
+
+  // the pair the cache held is the pair the call carried
+  const h = chats()[0].headers
+  expect(h.get("cosy-key")).toBe(KEY)
+  const payload = JSON.parse(Buffer.from(h.get("authorization").replace("Bearer COSY.", "").split(".")[0], "base64").toString("utf8"))
+  expect(payload.info).toBe(INFO)
+})

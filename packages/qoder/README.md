@@ -418,6 +418,12 @@ id's first 16 characters, so only the volume serial decides it.
   the IDE's three are used (`qmodel_latest`, `dashscope_qmodel`,
   `q36fmodel`). When the domain answers "Model not exist" for a model, the
   next one is asked.
+- A private deployment issues **no bearer token**: `cache/user`'s
+  `security_oauth_token`/`access_token`/`refresh_token` can all be empty, and
+  the account is named by its `key` + `encrypt_user_info` pair — the RSA-wrapped
+  AES key and the blob it opens, repeated on every call as the IDE does
+  (measured: one pair across 25 requests). Such an account carries no expiry,
+  so it never asks to be signed in again; only the IDE's own session does.
 - The request is the IDE's own shape, not Qoder's: `chat_context`,
   `chat_prompt`, `image_urls`, `is_reply`/`is_retry`, `source`, `version`,
   `chat_task`, `agent_id` (`agent_chat`), `task_id` (`common_chat`) and

@@ -114,6 +114,10 @@ function machineHostname(name = hostname()) {
 // userBlob and cosyHeaders take the site's own key and version when it has
 // them (another QwenWork-like service on the same protocol), else Qoder's.
 function userBlob(u, rsaKey = RSA_KEY) {
+  // a Lingma 1.0 deployment issues no bearer token: the pair its IDE cached
+  // is the account's, and every call repeats it (measured: one key and one
+  // info across 25 requests, while the cache's own pair stayed the same)
+  if (u?.key && u?.info) return { info: String(u.info), key: String(u.key) }
   const raw = JSON.stringify({ uid: u.uid, aid: "", name: u.name ?? "", email: u.email ?? "", security_oauth_token: u.access })
   const key = Buffer.from(hexID().slice(0, 16))
   const c = createCipheriv("aes-128-cbc", key, key)
@@ -126,7 +130,7 @@ function userBlob(u, rsaKey = RSA_KEY) {
 function cosyHeaders(url, u, body, site, ts = Math.floor(Date.now() / 1000)) {
   if (!u?.machineId) throw new Error(`${site?.name ?? "Qoder"}: the account has no machine id; sign in again`)
   const cosyVersion = site?.cosyVersion ?? COSY_VERSION
-  const blob = userBlob(u, site?.rsaKey)
+  const blob = userBlob({ ...u, key: site?.lingmaKey || u.key, info: site?.lingmaInfo || u.info }, site?.rsaKey)
   const payload = Buffer.from(
     // the request id is a dashed UUID, as Qoder's signer makes it; its
     // ideVersion is "" too
@@ -610,13 +614,21 @@ async function lingmaDecode(root) {
   const oauth = String(a?.security_oauth_token ?? "").trim()
   const access = oauth || String(a?.access_token ?? "").trim()
   const uid = String(a?.uid ?? a?.yx_uid ?? "").trim()
-  if (!access || !uid) {
+  // a private deployment issues no bearer token at all: its calls carry the
+  // account's own pair, the RSA-wrapped AES key and the blob that key opens,
+  // so that pair is what names the signed-in account
+  const key = String(a?.key ?? "").trim()
+  const info = String(a?.encrypt_user_info ?? "").trim()
+  const named = !!uid && !!(access || (key && info))
+  if (!named) {
     // say what the file did carry, without its values: the field names are
     // what tells a deployment's schema apart
     const said = [
       `uid: ${uid ? "yes" : "no"}`,
       `security_oauth_token: ${oauth ? "yes" : "no"}`,
       `access_token: ${String(a?.access_token ?? "").trim() ? "yes" : "no"}`,
+      `key: ${key ? "yes" : "no"}`,
+      `encrypt_user_info: ${info ? "yes" : "no"}`,
       `keys: ${Object.keys(a).slice(0, 40).join(",") || "(none)"}`,
     ].join("; ")
     return { root, reason: `cache/user names no signed-in account (${said})` }
@@ -629,10 +641,13 @@ async function lingmaDecode(root) {
     version: await lingmaVersion(root),
     uid,
     access,
+    key,
+    info,
+    onPremise: String(a.on_premise ?? ""),
+    userType: String(a.user_type ?? ""),
     email: String(a.email ?? ""),
     name: String(a.name ?? ""),
     orgId: String(a.organization_id ?? ""),
-    userType: String(a.user_type ?? ""),
     expires: Number.isFinite(end) && end > 0 ? end : 0,
   }
 }
@@ -643,7 +658,7 @@ async function lingmaRead(site, roots = lingmaRoots()) {
   const seen = []
   for (const root of roots) {
     const got = await lingmaDecode(root)
-    if (got.access) return got
+    if (lingmaNamed(got)) return got
     seen.push(`${root}: ${got.reason}`)
   }
   return new SignInGone(
@@ -651,6 +666,11 @@ async function lingmaRead(site, roots = lingmaRoots()) {
     true,
   )
 }
+
+// lingmaNamed is a cache that names a signed-in account: its uid and either a
+// bearer token (Qoder CN's) or the key/info pair a private deployment signs
+// with, which carries no token at all.
+const lingmaNamed = (got) => !!got?.uid && !!(got.access || (got.key && got.info))
 
 const lingmaLive = (got, now = Date.now()) => !got.expires || got.expires - now > LINGMA_LEAD
 
@@ -662,7 +682,9 @@ function lingmaAccount(site, origin, got) {
     access: got.access,
     // nothing here spends a refresh token: the IDE's worker renews it
     refresh: "",
-    expires: got.expires || Date.now() + DAY,
+    // a deployment that issues no token gives nothing to expire: only the
+    // IDE's own sign-in does, and the cache is read again when it changes
+    expires: got.expires || (got.access ? Date.now() + DAY : 0),
     accountId: `${got.email || got.uid} (${host})`,
     cardName: `${got.email || got.name || got.uid} (${host})`,
     uid: got.uid,
@@ -675,6 +697,8 @@ function lingmaAccount(site, origin, got) {
     dedicated: host,
     lingma: true,
     lingmaRoot: got.root,
+    ...(got.key && got.info ? { lingmaKey: got.key, lingmaInfo: got.info } : {}),
+    ...(got.onPremise ? { lingmaOnPremise: got.onPremise } : {}),
     ...(got.version ? { lingmaVersion: got.version } : {}),
     ...(got.userType ? { lingmaUserType: got.userType } : {}),
   }
@@ -1042,7 +1066,12 @@ function siteOf(site, a) {
   if (a?.dedicated && a.lingma) {
     const s = lingmaSite(site, a.dedicated, a.lingmaVersion)
     if (!s) throw new SignInGone(`${site.name}: the account's dedicated domain "${a.dedicated}" isn't one; sign in again`)
-    return { ...s, lingmaUserType: a.lingmaUserType ?? "" }
+    return {
+      ...s,
+      lingmaUserType: a.lingmaUserType ?? "",
+      lingmaKey: a.lingmaKey ?? "",
+      lingmaInfo: a.lingmaInfo ?? "",
+    }
   }
   if (a?.dedicated) {
     const s = dedicatedSite(site, a.dedicated, a.dedicatedApi)
@@ -3838,10 +3867,15 @@ const makePlugin = (site) => async ({ client }) => {
   const fresh = (getAuth) =>
     locked(async () => {
       const stored = await getAuth()
-      if (stored?.type !== "oauth" || !stored.access || !stored.uid) throw new SignInGone(`${site.name}: not signed in`)
+      // a Lingma 1.0 account signs with its key/info pair and may carry no
+      // bearer token at all (a private deployment issues none)
+      const named = stored?.type === "oauth" && stored.uid && (stored.access || (stored.lingma && stored.lingmaKey && stored.lingmaInfo))
+      if (!named) throw new SignInGone(`${site.name}: not signed in`)
       siteOf(site, stored) // a VPC instance on record that names none is no sign-in
       // renewed already (by magpie's auth.refresh), the store not yet saying so
       const a = latest(stored)
+      // nothing of a token-less account is on a clock: only the IDE renews it
+      if (a.lingma && !a.expires) return a
       if (a.expires - Date.now() > REFRESH_LEAD) return a
       const next = { ...a, ...(await renew(a)) }
       await client.auth.set({ path: { id: ID }, body: next })
