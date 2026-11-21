@@ -544,3 +544,13 @@ test("a Lingma stream's content, native tool calls and tail are all read", async
   // and the request named the tool as the deployment takes them
   expect(JSON.parse(_internal.decodeBody(chats()[0].body)).tools[0].function.name).toBe("read_file")
 })
+
+test("the domain field takes lingma://, which the validator must not refuse", async () => {
+  const m = lingmaMethod(await QoderCNAuthPlugin({ client: store().client }))
+  const field = m.prompts.find((p) => p.key === "dedicated")
+  expect(field.validate(`lingma://${HOST}`)).toBeUndefined()
+  expect(field.validate(`cosy://${HOST}`)).toBeUndefined()
+  expect(field.validate(HOST)).toBeUndefined()
+  expect(field.validate(`https://${HOST}/x`)).toBeUndefined()
+  expect(String(field.validate("ftp://x"))).toContain("Not a dedicated domain")
+})

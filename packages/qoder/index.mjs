@@ -339,11 +339,18 @@ function vpcSite(site, instance) {
 const DEDICATED_CLIENT = "f5a7f67c-11a8-491e-8b8e-a07f2d0df4b7"
 const DEDICATED_VERSION = "/algo/api/v1/version"
 
+// LINGMA_SCHEME marks an address as a Lingma 1.0 deployment outright,
+// whatever its /algo/api/v1/version probe answers: a 通义灵码 private
+// deployment answers the probe, which would otherwise read as Qoder CN 2.0.
+const LINGMA_SCHEME = /^(?:lingma|cosy):\/\//i
+
 // dedicatedOrigin is the https origin of what the user entered as their
-// dedicated domain: a host or an https:// address, a path dropped as the
-// IDE drops it for sign-in. undefined: not one (http://, credentials, no host).
+// dedicated domain: a host, an https:// address, or a lingma:// one (the
+// scheme names the protocol, not a different address), a path dropped as
+// the IDE drops it for sign-in. undefined: not one (http://, credentials,
+// no host).
 function dedicatedOrigin(input) {
-  let e = String(input ?? "").trim()
+  let e = String(input ?? "").trim().replace(LINGMA_SCHEME, "")
   if (!e) return undefined
   if (!/^[a-z][a-z\d+.-]*:\/\//i.test(e)) e = `https://${e}`
   let u
@@ -408,8 +415,8 @@ async function dedicatedProbe(origin) {
 // its own version, which the probe would otherwise read as Qoder CN 2.0.
 async function dedicatedSignIn(site, input) {
   const said = String(input ?? "").trim()
-  const forced = /^(?:lingma|cosy):\/\//i.test(said)
-  const origin = dedicatedOrigin(said.replace(/^(?:lingma|cosy):\/\//i, ""))
+  const forced = LINGMA_SCHEME.test(said)
+  const origin = dedicatedOrigin(said)
   if (!origin) throw new Error(`Not a dedicated domain: ${String(input ?? "").slice(0, 100)}`)
   if (forced) return lingmaSignIn(site, origin)
   const status = await dedicatedProbe(origin)
@@ -4544,8 +4551,8 @@ const makePlugin = (site) => async ({ client }) => {
                     type: "text",
                     key: "dedicated",
                     message: "Your enterprise's dedicated domain, as set in Qoder IDE (企业版专属域地址)",
-                    placeholder: "your-corp.rdc.aliyuncs.com or https://your-corp.rdc.aliyuncs.com",
-                    validate: (v) => (dedicatedOrigin(v) ? undefined : "Not a dedicated domain: enter its host or https:// address"),
+                    placeholder: "your-corp.rdc.aliyuncs.com, https://…, or lingma://… for a 通义灵码 deployment",
+                    validate: (v) => (dedicatedOrigin(v) ? undefined : "Not a dedicated domain: enter its host, an https:// address, or lingma://<host> for a Lingma deployment"),
                   },
                 ],
                 authorize: (inputs) => dedicatedSignIn(site, inputs?.dedicated),
