@@ -39,6 +39,31 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# PowerShell resolves relative paths against $PWD, but [System.IO.File] and
+# friends use the process's own cwd, which stays where powershell.exe started:
+# without this, "the file is right here" still fails to open.
+[Environment]::CurrentDirectory = (Get-Location).ProviderPath
+
+# Read text without mangling it. Windows PowerShell 5.1's Get-Content decodes
+# UTF-8 as ANSI, which turns 中文 into mojibake; and a prompt saved by an editor
+# or by ">" may be ANSI or UTF-16. Honour a BOM, else try UTF-8 strictly, else
+# fall back to the machine's ANSI codepage.
+function Read-TextFile {
+  param([string]$Path)
+  $b = [System.IO.File]::ReadAllBytes($Path)
+  if ($b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF) {
+    return [System.Text.Encoding]::UTF8.GetString($b, 3, $b.Length - 3)
+  }
+  if ($b.Length -ge 2 -and $b[0] -eq 0xFF -and $b[1] -eq 0xFE) {
+    return [System.Text.Encoding]::Unicode.GetString($b, 2, $b.Length - 2)
+  }
+  if ($b.Length -ge 2 -and $b[0] -eq 0xFE -and $b[1] -eq 0xFF) {
+    return [System.Text.Encoding]::BigEndianUnicode.GetString($b, 2, $b.Length - 2)
+  }
+  $strict = New-Object System.Text.UTF8Encoding($false, $true)
+  try { return $strict.GetString($b) } catch { return [System.Text.Encoding]::Default.GetString($b) }
+}
+
 # extension -> the IDE's own language name (as its chats name them)
 $LangOf = @{
   ".sh" = "shell"; ".bash" = "shell"; ".zsh" = "shell"; ".ksh" = "shell"
@@ -76,7 +101,7 @@ function Find-Workspace {
       Sort-Object { (Get-Item -LiteralPath $_).LastWriteTime } -Descending
     foreach ($f in $files) {
       try {
-        [xml]$x = Get-Content -LiteralPath $f -Raw
+        [xml]$x = Read-TextFile -Path $f
         $loc = $x.SelectSingleNode("//option[@name='lastProjectLocation']")
         if ($loc -and $loc.value) {
           $p = $loc.value -replace '^\$USER_HOME\$', $env:USERPROFILE
@@ -103,7 +128,7 @@ function Get-ActiveFile {
   $ws = Join-Path $Root ".idea\workspace.xml"
   if (-not (Test-Path -LiteralPath $ws)) { return "" }
   try {
-    [xml]$x = Get-Content -LiteralPath $ws -Raw
+    [xml]$x = Read-TextFile -Path $ws
     foreach ($node in $x.SelectNodes("//component[@name='FileEditorManager']//entry[@file]")) {
       $p = $node.file -replace '^file://\$PROJECT_DIR\$', $Root -replace '^file:///', '' -replace '/', '\'
       if (Test-Path -LiteralPath $p) { return $p }
@@ -203,7 +228,7 @@ function Decode-CosyBody {
 
 function Read-CapturePrompt {
   param([string]$Path)
-  $raw = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8).Trim()
+  $raw = (Read-TextFile -Path $Path).Trim()
   $obj = $null
   try { $obj = $raw | ConvertFrom-Json } catch { }
   if (-not $obj) { $obj = (Decode-CosyBody -Wire $raw) | ConvertFrom-Json }
@@ -266,7 +291,7 @@ if ($FromCapture) {
   $ctx.systemPrompt = Set-UserInfo -Prompt $prompt -Os $osLabel -Ide $ideLabel -Root $root -Languages $languages
 } elseif ($SystemPromptFile) {
   if (-not (Test-Path -LiteralPath $SystemPromptFile)) { Write-Error "no such file: $SystemPromptFile"; exit 1 }
-  $ctx.systemPrompt = Get-Content -LiteralPath $SystemPromptFile -Raw
+  $ctx.systemPrompt = Read-TextFile -Path $SystemPromptFile
 }
 
 if (-not $OutFile) {
@@ -275,7 +300,24 @@ if (-not $OutFile) {
 }
 $dir = Split-Path -Parent $OutFile
 if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-$json = $ctx | ConvertTo-Json -Depth 4
+# Every value is a plain string or an array of strings, and the file stays
+# small: a field that somehow grew (a path that is an object, a language list
+# of thousands) is refused rather than written.
+$ctx.workspace          = [string]$ctx.workspace
+$ctx.activeFilePath     = [string]$ctx.activeFilePath
+$ctx.codeLanguage       = [string]$ctx.codeLanguage
+$ctx.os                 = [string]$ctx.os
+$ctx.ide                = [string]$ctx.ide
+$ctx.collectedAt        = [string]$ctx.collectedAt
+$ctx.workspaceLanguages = @($ctx.workspaceLanguages | Where-Object { $_ -is [string] -and $_ } | Select-Object -Unique -First 24)
+if ($ctx.systemPrompt) { $ctx.systemPrompt = [string]$ctx.systemPrompt }
+
+$json = $ctx | ConvertTo-Json -Depth 2
+if ($json.Length -gt 65536) {
+  Write-Error "the context came out $($json.Length) chars; refusing to write it. Largest fields:"
+  $ctx.Keys | ForEach-Object { "{0,-20} {1,8}" -f $_, (([string]$ctx[$_] | Measure-Object -Character).Characters) }
+  exit 1
+}
 [System.IO.File]::WriteAllText($OutFile, $json, (New-Object System.Text.UTF8Encoding($false)))
 
 Write-Host "workspace : $root"

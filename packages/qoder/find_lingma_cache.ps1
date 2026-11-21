@@ -44,7 +44,7 @@ foreach ($r in $roots) {
         cacheUser = $_.FullName
         bytes     = $_.Length
         written   = $_.LastWriteTime.ToString("s")
-        cacheId   = if (Test-Path -LiteralPath $id) { "yes ($((Get-Content -LiteralPath $id -TotalCount 1)))" } else { "no" }
+        cacheId   = if (Test-Path -LiteralPath $id) { "yes ($(([System.IO.File]::ReadAllText($id, [System.Text.Encoding]::UTF8)).Trim()))" } else { "no" }
         version   = if (Test-Path -LiteralPath (Join-Path $home_ "config.json")) { "config.json" } else { "" }
       }
     }
