@@ -618,3 +618,31 @@ test("a cache with no token signs in on its key and info pair, and repeats it", 
   const payload = JSON.parse(Buffer.from(h.get("authorization").replace("Bearer COSY.", "").split(".")[0], "base64").toString("utf8"))
   expect(payload.info).toBe(INFO)
 })
+
+// The IDE's own list names a context window and nothing else: its requests
+// carry parameters: null, so the deployment's own default is the output
+// ceiling. The plugin must not invent either.
+test("a model's window is the deployment's, and its output ceiling is left to the deployment", async () => {
+  const ORG = "org_glm-latest-coder_de64ea6840e65a7e032cb9bd383a79a3"
+  route = (at) => {
+    if (at === HOST + _internal.LINGMA_MODELS_PATH)
+      return json({ chat: [
+        { key: ORG, format: "openai", source: "organization", display_name: "glm-latest-coder", is_vl: false, max_input_tokens: 96000, enable: true },
+        { key: "with-ceiling", format: "openai", source: "organization", display_name: "ceiling", max_input_tokens: 32000, max_output_tokens: 8192, enable: true },
+      ] })
+    if (at === HOST + CHAT) return sse(OK)
+    return new Response("", { status: 404 })
+  }
+  const s = store(signedIn())
+  const hooks = await QoderCNAuthPlugin({ client: s.client })
+  const ms = await hooks.provider.models({ models: {} }, { auth: s.auth() })
+  // the window the deployment named
+  expect(ms[ORG].limit).toEqual({ context: 96000, output: 0 })
+  // and a ceiling it did name is taken
+  expect(ms["with-ceiling"].limit).toEqual({ context: 32000, output: 8192 })
+
+  // what is sent keeps the IDE's own: no max_tokens of our own
+  const opts = await hooks.auth.loader(s.get)
+  await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ ...ask, model: ORG, max_tokens: 384000 }) })
+  expect(JSON.parse(_internal.decodeBody(chats()[0].body)).parameters).toBe(null)
+})

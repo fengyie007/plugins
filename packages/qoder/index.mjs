@@ -1485,11 +1485,19 @@ async function fetchListing(site, cred) {
   return JSON.parse(text)
 }
 
+// outputOf is a listing's own output ceiling, when it names one. Neither the
+// IDE's list nor its requests do (parameters is null), so this is 0 — unknown,
+// never a limit the plugin invents.
+const outputOf = (raw) => {
+  const n = (v) => (Number.isInteger(v) && v > 0 ? v : 0)
+  return n(raw?.max_output_tokens) || n(raw?.maxOutputTokens) || 0
+}
+
 function configModel(m) {
   const images = !!m.images
   return {
     name: m.name,
-    limit: { context: m.context ?? 0, output: 0 },
+    limit: { context: m.context ?? 0, output: outputOf(m.config) },
     // Said either way, image or no image. A kind left out is not "text only"
     // to magpie: it is "the vendor didn't say", and magpie then falls back to
     // models.dev's vote by bare model id — where a same-named model of
@@ -1515,7 +1523,7 @@ function runtimeModel(site, m) {
     headers: {},
     options: {},
     cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    limit: { context: m.context ?? 0, output: 0 },
+    limit: { context: m.context ?? 0, output: outputOf(m.config) },
     capabilities: {
       temperature: true,
       reasoning: !!m.efforts?.length,
@@ -4669,7 +4677,7 @@ const makePlugin = (site) => async ({ client }) => {
           if (!ms.length) return provider.models
           const s = siteOf(site, cred)
           return Object.fromEntries(
-            ms.map((m) => [m.key, runtimeModel(s, { id: m.key, name: m.name, context: m.context, images: m.images, efforts: m.thinks ? m.efforts : [], free: m.free, rate: m.rate, rateWas: m.rateWas })]),
+            ms.map((m) => [m.key, runtimeModel(s, { id: m.key, name: m.name, context: m.context, images: m.images, efforts: m.thinks ? m.efforts : [], free: m.free, rate: m.rate, rateWas: m.rateWas, config: m.config })]),
           )
         } catch {
           return provider.models
