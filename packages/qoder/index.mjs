@@ -926,8 +926,15 @@ function lingmaBody(chat, m, named, site, images = [], ctx = {}) {
   // the deployment's own prompt, when the collector captured it: the IDE's is
   // served to its worker, not carried in the binary (no "You are Lingma" in
   // either exe), so it can only be injected, never rebuilt here
-  const baseSystem = String(ctx?.systemPrompt ?? "").trim() || site?.systemPrompt || [LINGMA_SYS, lingmaUserInfo(ctx)].filter(Boolean).join("\n\n")
-  const sysText = system ? baseSystem + "\n\n" + system : baseSystem
+  // The IDE sends one system turn: the prompt its deployment served it. A
+  // captured prompt is therefore the whole of it, and the client's own prompt
+  // (pi's, say) is dropped rather than appended, so the request looks like the
+  // IDE's. COSY_LINGMA_KEEP_CLIENT_PROMPT=1 appends it back for a site whose
+  // tools only the client's prompt describes.
+  const captured = String(ctx?.systemPrompt ?? "").trim()
+  const baseSystem = captured || site?.systemPrompt || [LINGMA_SYS, lingmaUserInfo(ctx)].filter(Boolean).join("\n\n")
+  const keepClient = /^(1|true|yes)$/i.test(String(process.env.COSY_LINGMA_KEEP_CLIENT_PROMPT ?? "").trim())
+  const sysText = system && (keepClient || !captured) ? baseSystem + "\n\n" + system : baseSystem
   const budget = chat.max_completion_tokens || chat.max_tokens || 0
   const [thinking] = effortFor(chat.reasoning_effort, m, typeof budget === "number" ? budget : 0)
   const languages = Array.isArray(ctx?.workspaceLanguages) ? ctx.workspaceLanguages.filter((x) => typeof x === "string" && x.trim()) : []

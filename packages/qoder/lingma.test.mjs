@@ -395,9 +395,33 @@ test("the body carries the capture's own values, and the workspace the collector
   expect(body.code_language).toBe("Markdown")
   expect(body.chat_context.workspaceLanguages).toEqual(["shell", "sql"])
   expect(body.chat_context.activeFilePath).toBe("D:\work\README.md")
-  // the prompt the collector captured is the one the turns are given
+  // the prompt the collector captured is the one the turns are given, alone:
+  // the IDE sends a single system turn and the client's own prompt is dropped
   expect(body.messages[0].role).toBe("system")
-  expect(body.messages[0].content).toContain("PROMPT FROM THE DEPLOYMENT")
+  expect(body.messages[0].content).toBe("PROMPT FROM THE DEPLOYMENT")
+})
+
+test("a captured prompt replaces the client's; COSY_LINGMA_KEEP_CLIENT_PROMPT=1 appends it back", async () => {
+  ideCache(cosy, ACCOUNT())
+  writeFileSync(join(cosy, _internal.LINGMA_CONTEXT_FILE), JSON.stringify({ systemPrompt: "PROMPT FROM THE DEPLOYMENT" }))
+  route = (at) => (at === HOST + CHAT ? sse(OK) : new Response("", { status: 404 }))
+  const s = store(signedIn({ lingmaRoot: cosy }))
+  const opts = await (await QoderCNAuthPlugin({ client: s.client })).auth.loader(s.get)
+  const send = async (messages) => {
+    seen = []
+    await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ ...ask, messages }) })
+    return JSON.parse(_internal.decodeBody(chats()[0].body)).messages[0].content
+  }
+  const withClient = [{ role: "system", content: "PI'S OWN PROMPT" }, { role: "user", content: "hi" }]
+  expect(await send(withClient)).toBe("PROMPT FROM THE DEPLOYMENT")
+  process.env.COSY_LINGMA_KEEP_CLIENT_PROMPT = "1"
+  try {
+    const kept = await send(withClient)
+    expect(kept).toContain("PROMPT FROM THE DEPLOYMENT")
+    expect(kept).toContain("PI'S OWN PROMPT")
+  } finally {
+    delete process.env.COSY_LINGMA_KEEP_CLIENT_PROMPT
+  }
 })
 
 // The deployment reads an image from its own file service: the chat names a
