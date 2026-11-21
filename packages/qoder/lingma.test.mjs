@@ -670,3 +670,40 @@ test("a model's window is the deployment's, and its output ceiling is left to th
   await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ ...ask, model: ORG, max_tokens: 384000 }) })
   expect(JSON.parse(_internal.decodeBody(chats()[0].body)).parameters).toBe(null)
 })
+
+// The captured prompt names the IDE's tools (search_codebase, edit_file,
+// run_in_terminal); a client offers its own (grep, edit, bash). The request
+// declares the prompt's names and the answer gives back the client's, so the
+// prompt's words land on a tool that exists and the client gets a name it
+// offered.
+test("the prompt's tool names are declared upstream and the client's own given back", async () => {
+  const chunk = (delta, finish_reason) =>
+    frame({ id: "c", object: "chat.completion.chunk", created: 1, model: "qmodel_latest", choices: [{ index: 0, delta, finish_reason: finish_reason ?? null }] })
+  const reply =
+    chunk({ role: "assistant", content: "" }) +
+    chunk({ tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "run_in_terminal", arguments: '{"command":' } }] }) +
+    chunk({ tool_calls: [{ index: 0, function: { arguments: '"ls"}' } }] }) +
+    chunk({}, "tool_calls")
+  route = (at) => (at === HOST + CHAT ? new Response(reply, { headers: { "Content-Type": "text/event-stream" } }) : new Response("", { status: 404 }))
+  const s = store(signedIn())
+  const opts = await (await QoderCNAuthPlugin({ client: s.client })).auth.loader(s.get)
+  const tools = ["bash", "read", "edit", "grep"].map((n) => ({ type: "function", function: { name: n, parameters: { type: "object", properties: {} } } }))
+  const res = await opts.fetch(opts.baseURL + "/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({ model: "qmodel_latest", messages: [{ role: "user", content: "列一下" }], tools }),
+  })
+  expect(res.status).toBe(200)
+  const declared = JSON.parse(_internal.decodeBody(chats()[0].body)).tools.map((t) => t.function.name)
+  expect(declared).toEqual(["run_in_terminal", "read_file", "edit_file", "grep_code"])
+  const out = await res.json()
+  expect(out.choices[0].message.tool_calls?.[0].function).toMatchObject({ name: "bash", arguments: '{"command":"ls"}' })
+})
+
+test("a tool already named as the prompt names it is left alone", () => {
+  const t = (name) => ({ type: "function", function: { name } })
+  const { up, down } = _internal.lingmaToolAliases([t("read_file"), t("bash"), t("unknown_tool")])
+  expect(up.get("bash")).toBe("run_in_terminal")
+  expect(up.has("read_file")).toBe(false)
+  expect(up.has("unknown_tool")).toBe(false)
+  expect(down.get("run_in_terminal")).toBe("bash")
+})

@@ -76,6 +76,47 @@ const QODER_SYS = "You are a Qoder agent. Use the instructions below and the too
 // plugin's own words in the same register.
 const LINGMA_SYS = "You are Lingma (灵码), an intelligent coding assistant created by the Alibaba Cloud technical team. You assist the user with coding tasks: answering questions, explaining code, and suggesting changes."
 
+// LINGMA_TOOL_ALIASES maps the names the IDE's captured prompt talks about
+// (search_codebase, edit_file, run_in_terminal, ...) onto the tools this
+// client actually offers, so the prompt's own words land on something that
+// exists. A name the client already serves is left alone: the client's tools
+// are what gets executed, the model only ever sees these names. Renaming
+// happens both ways — the declaration sent upstream and the call streamed
+// back — so the client never sees a name it didn't offer. The order matters:
+// a client name is claimed by the first entry that lists it, so the closest
+// match comes first (read is read_file before it is list_dir).
+const LINGMA_TOOL_ALIASES = {
+  read_file: ["read", "read_file"],
+  edit_file: ["edit", "write", "str_replace"],
+  run_in_terminal: ["bash", "shell", "run"],
+  get_terminal_output: ["bash_output", "terminal_output"],
+  get_problems: ["diagnostics", "lsp"],
+  grep_code: ["grep", "grep_code", "search"],
+  search_file: ["glob", "find", "search_file"],
+  list_dir: ["ls", "list_dir"],
+  search_codebase: ["search_codebase", "semantic_search"],
+  search_symbol: ["symbol", "symbols"],
+  create_memory: ["memory", "remember"],
+  fetch_content: ["webfetch", "fetch", "web_fetch"],
+}
+
+// lingmaToolAliases answers, for the tools a chat offers, the name to send
+// upstream (a Lingma name the prompt knows, when one of its names is offered)
+// and the name to give back (the client's own). Only offered tools appear.
+function lingmaToolAliases(tools) {
+  const offered = new Set(tools.map((t) => t?.function?.name).filter(Boolean))
+  const up = new Map() // client name -> name sent upstream
+  const down = new Map() // name sent upstream -> client name
+  for (const [lingma, ours] of Object.entries(LINGMA_TOOL_ALIASES)) {
+    if (offered.has(lingma) || down.has(lingma)) continue
+    const hit = ours.find((n) => offered.has(n) && !up.has(n))
+    if (!hit) continue
+    up.set(hit, lingma)
+    down.set(lingma, hit)
+  }
+  return { up, down }
+}
+
 const hexID = () => randomUUID().replaceAll("-", "")
 
 // ---- the COSY envelope --------------------------------------------------------
@@ -823,14 +864,15 @@ const LINGMA_UPLOAD_PATH = "/algo/api/v2/image/upload"
 // lingmaMessages are a chat's turns as the IDE writes them: a content is a
 // plain string (not parts), a tool turn names the call it answers, and tool
 // calls stay OpenAI's.
-function lingmaMessages(messages) {
+function lingmaMessages(messages, up = null) {
   const out = []
+  const nameOf = (n) => up?.get(n) ?? n
   for (const m of messages ?? []) {
     const role = m?.role
     if (!role || role === "system" || role === "developer") continue
     const content = textOf(m.content)
     if (role === "tool") {
-      out.push({ role: "tool", content, ...(m.name ? { name: String(m.name) } : {}), ...(m.tool_call_id ? { tool_call_id: String(m.tool_call_id) } : {}) })
+      out.push({ role: "tool", content, ...(m.name ? { name: nameOf(String(m.name)) } : {}), ...(m.tool_call_id ? { tool_call_id: String(m.tool_call_id) } : {}) })
       continue
     }
     if (role === "assistant") {
@@ -843,7 +885,7 @@ function lingmaMessages(messages) {
               tool_calls: calls.map((t) => ({
                 id: String(t.id ?? ""),
                 type: "function",
-                function: { name: t.function.name, arguments: typeof t.function.arguments === "string" ? t.function.arguments : JSON.stringify(t.function.arguments ?? {}) },
+                function: { name: nameOf(t.function.name), arguments: typeof t.function.arguments === "string" ? t.function.arguments : JSON.stringify(t.function.arguments ?? {}) },
               })),
             }
           : {}),
@@ -917,7 +959,9 @@ async function lingmaContext(account) {
 // values the IDE sends but a plugin cannot know (workspace languages, the
 // active file, code language) are left empty.
 function lingmaBody(chat, m, named, site, images = [], ctx = {}) {
-  const turns = lingmaMessages(chat.messages)
+  const offered = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function" && t.function?.name) : []
+  const { up } = lingmaToolAliases(offered)
+  const turns = lingmaMessages(chat.messages, up)
   const said = (() => {
     for (let i = turns.length - 1; i >= 0; i--) if (turns[i].role === "user") return turns[i].content
     return ""
@@ -978,12 +1022,12 @@ function lingmaBody(chat, m, named, site, images = [], ctx = {}) {
     model_config: modelConfig(m, thinking, true),
     messages: [{ role: "system", content: sysText }, ...turns],
   }
-  const tools = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function" && t.function?.name) : []
-  if (tools.length)
-    body.tools = tools.map((t) => ({
+  if (offered.length) {
+    body.tools = offered.map((t) => ({
       type: "function",
-      function: { name: t.function.name, description: t.function.description ?? "", parameters: typedUnions(t.function.parameters) ?? { type: "object", properties: {} } },
+      function: { name: up.get(t.function.name) ?? t.function.name, description: t.function.description ?? "", parameters: typedUnions(t.function.parameters) ?? { type: "object", properties: {} } },
     }))
+  }
   return body
 }
 
@@ -2857,15 +2901,16 @@ async function* sseLines(body) {
 // events turns Qoder's SSE into chat completion pieces: each data line's
 // envelope has a "body" that is an OpenAI chunk, whose content may hold
 // tool calls to lift out.
-async function* events(body, tools = []) {
+async function* events(body, tools = [], down = null) {
   const a = new Splitter(tools)
+  const back = (name) => (down?.get(name) ?? name)
   let index = -1 // the tool call being given
   const native = new Map() // upstream index -> call and its output index
   const begun = [] // every native call, one an index has moved past too
   // one piece of the split text as an event: a call, text, or a call that
   // can't be read, which ends the turn as a 502
   const piece = (f) =>
-    f.call ? { tool: { index: ++index, id: "call_" + hexID(), name: f.call.name, args: f.call.args } } : f.error ? { error: { status: 502, message: f.error } } : { text: f.text }
+    f.call ? { tool: { index: ++index, id: "call_" + hexID(), name: back(f.call.name), args: f.call.args } } : f.error ? { error: { status: 502, message: f.error } } : { text: f.text }
   let usage
   let fr = ""
   // said: something of the answer has been given (text, reasoning or a
@@ -2941,7 +2986,7 @@ async function* events(body, tools = []) {
         }
         a.sawTool = said = true
         call.index = ++index
-        yield { tool: { index: call.index, id: call.id || "call_" + hexID(), name, args: call.args } }
+        yield { tool: { index: call.index, id: call.id || "call_" + hexID(), name: back(name), args: call.args } }
       } else if (args) yield { args: { index: call.index, text: args } }
     }
     fr = chunk?.choices?.[0]?.finish_reason || fr
@@ -2993,8 +3038,8 @@ const NAMELESS = "the model's native tool call has no name; it is not sent on as
 // opened is a chat reply's events and the first of them, read before
 // anything is answered: a refusal in the stream (Qoder's queue among them)
 // comes first.
-async function opened(res, tools) {
-  const it = events(res.body, tools)
+async function opened(res, tools, down = null) {
+  const it = events(res.body, tools, down)
   return { it, first: await it.next() }
 }
 
@@ -4385,7 +4430,13 @@ const makePlugin = (site) => async ({ client }) => {
     if (!want) return errorResponse({ status: 400, message: `unknown model "${chat.model}"; this dedicated domain serves ${list.map((x) => x.key).join(", ")}` })
     const order = [want, ...list.filter((x) => x !== want)]
     const task = taskOf(sessionOf(chat, named), chat)
-    const tools = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function") : []
+    const tools = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function" && t.function?.name) : []
+    // the captured prompt talks about the IDE's tool names; the client offers
+    // its own. Declare them upstream as the prompt's names and give the
+    // client back the names it offered.
+    const { up, down } = lingmaToolAliases(tools)
+    // the splitter reads the model's calls by the names the request declared
+    const upTools = tools.map((t) => (up.has(t.function.name) ? { ...t, function: { ...t.function, name: up.get(t.function.name) } } : t))
     // the chat's images go up once, before any model is asked: a retry on the
     // next model names the same urls
     const ctx = await lingmaContext(cred)
@@ -4415,7 +4466,7 @@ const makePlugin = (site) => async ({ client }) => {
       let res, open
       try {
         res = await fetch(url, { method: "POST", headers: lingmaHeaders(url, cred, wire, s), body: wire, signal })
-        if (res.ok) open = await opened(res, tools)
+        if (res.ok) open = await opened(res, upTools, down)
       } catch (e) {
         return errorResponse({ status: 502, message: e.message })
       }
@@ -4757,4 +4808,4 @@ export async function QwenWorkEnterpriseAuthPlugin({ client }) {
 export const protocol = { makePlugin, deviceSignIn, openapi, siteOf }
 
 // for tests
-export const _internal = { spentOf, OUTPUT_CAPS, LEARNED_CAPS, outputCap, fetchListing, accountIdentity, deviceRefreshBody, qwenworkClientHeaders, freeView, maskPhone, phoneLabelOf, realEmailOf, chatHeaders, machineOS, machineHostname, cosyHeaders, typedUnions, Splitter, campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, dedicatedOrigin, dedicatedHost, dedicatedSite, dedicatedSignIn, lingmaRoots, lingmaDecode, lingmaSite, lingmaHeaders, lingmaListing, lingmaJsonHeaders, LINGMA_MODELS_PATH, LINGMA_LISTINGS, lingmaContext, LINGMA_CONTEXT_FILE, lingmaUploadImage, lingmaImages, lingmaImageUrls, chatImages, dataUrlBytes, LINGMA_UPLOAD_PATH, lingmaBody, lingmaMessages, lingmaImageLines, lingmaUserInfo, LINGMA_SYS, lingmaDerivedMachineIds, lingmaMachineIdFrom, lingmaAddSystemMark, lingmaVersion, lingmaMacs, fitLen, LINGMA_MODELS, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, kimiModel, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }
+export const _internal = { spentOf, OUTPUT_CAPS, LEARNED_CAPS, outputCap, fetchListing, accountIdentity, deviceRefreshBody, qwenworkClientHeaders, freeView, maskPhone, phoneLabelOf, realEmailOf, chatHeaders, machineOS, machineHostname, cosyHeaders, typedUnions, Splitter, campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, dedicatedOrigin, dedicatedHost, dedicatedSite, dedicatedSignIn, lingmaRoots, lingmaDecode, lingmaSite, lingmaHeaders, lingmaListing, lingmaJsonHeaders, LINGMA_MODELS_PATH, LINGMA_LISTINGS, lingmaContext, LINGMA_CONTEXT_FILE, lingmaUploadImage, lingmaImages, lingmaImageUrls, chatImages, dataUrlBytes, LINGMA_UPLOAD_PATH, lingmaBody, lingmaMessages, lingmaImageLines, lingmaUserInfo, LINGMA_SYS, LINGMA_TOOL_ALIASES, lingmaToolAliases, lingmaDerivedMachineIds, lingmaMachineIdFrom, lingmaAddSystemMark, lingmaVersion, lingmaMacs, fitLen, LINGMA_MODELS, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, kimiModel, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }
