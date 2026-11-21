@@ -554,3 +554,19 @@ test("the domain field takes lingma://, which the validator must not refuse", as
   expect(field.validate(`https://${HOST}/x`)).toBeUndefined()
   expect(String(field.validate("ftp://x"))).toContain("Not a dedicated domain")
 })
+
+test("a private deployment's token in access_token is taken when security_oauth_token is empty", async () => {
+  // a real 通义灵码 cache can leave the IDE's chat token empty
+  ideCache(join(sandbox, "tok"), ACCOUNT({ security_oauth_token: "", access_token: "pt-FromAccessToken" }))
+  const got = await _internal.lingmaDecode(join(sandbox, "tok"))
+  expect(got.access).toBe("pt-FromAccessToken")
+  expect(got.uid).toBe(ACCOUNT().uid)
+
+  // and one with neither says which fields it did have, never their values
+  ideCache(join(sandbox, "none"), { uid: "u1", name: "n", some_field: "secret-value" })
+  const none = await _internal.lingmaDecode(join(sandbox, "none"))
+  expect(none.reason).toContain("names no signed-in account")
+  expect(none.reason).toContain("security_oauth_token: no")
+  expect(none.reason).toContain("some_field")
+  expect(none.reason).not.toContain("secret-value")
+})

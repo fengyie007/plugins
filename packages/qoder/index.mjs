@@ -604,9 +604,23 @@ async function lingmaDecode(root) {
     }
   }
   if (!a) return { root, reason: reasons[0] ?? (id ? "cache/user doesn't open with the machine id" : "cache/user doesn't open with a derived machine id") }
-  const access = String(a?.security_oauth_token ?? "").trim()
-  const uid = String(a?.uid ?? "").trim()
-  if (!access || !uid) return { root, reason: "cache/user names no signed-in account" }
+  // security_oauth_token is the IDE's chat token; a private deployment can
+  // leave it empty and carry the account's own in access_token (the plugin
+  // signs with the COSY envelope either way, so this only names the account)
+  const oauth = String(a?.security_oauth_token ?? "").trim()
+  const access = oauth || String(a?.access_token ?? "").trim()
+  const uid = String(a?.uid ?? a?.yx_uid ?? "").trim()
+  if (!access || !uid) {
+    // say what the file did carry, without its values: the field names are
+    // what tells a deployment's schema apart
+    const said = [
+      `uid: ${uid ? "yes" : "no"}`,
+      `security_oauth_token: ${oauth ? "yes" : "no"}`,
+      `access_token: ${String(a?.access_token ?? "").trim() ? "yes" : "no"}`,
+      `keys: ${Object.keys(a).slice(0, 40).join(",") || "(none)"}`,
+    ].join("; ")
+    return { root, reason: `cache/user names no signed-in account (${said})` }
+  }
   const end = Number(a.expire_time)
   return {
     root,
