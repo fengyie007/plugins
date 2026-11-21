@@ -437,7 +437,10 @@ id's first 16 characters, so only the volume serial decides it.
   `-FromCapture <a captured request body>` and the script takes the prompt
   that request carried (decoding the `Encode=1` body itself) and rewrites its
   `<user_info>` with this machine's OS, IDE, workspace and languages; or
-  `-SystemPromptFile` with the text alone.
+  `-SystemPromptFile` with the text alone. With neither, the plugin's own
+  Lingma prompt is sent, followed by a `<user_info>` built from the collected
+  facts — so the IDE a chat names is the one the collector found (its
+  JetBrains folder), never the tool the plugin runs in.
 - Images are taken: a `data:` URL is first PUT to the deployment's own
   `/algo/api/v2/image/upload` (multipart, one `file` part, the envelope
   signing the body's *length*) and the url it answers is named in the

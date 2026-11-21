@@ -71,6 +71,11 @@ XcW+ML9FoCI6AOvOzwIDAQAB
 
 const QODER_SYS = "You are a Qoder agent. Use the instructions below and the tools available to you to assist the user."
 
+// LINGMA_SYS is what a Lingma 1.0 deployment is told when no captured prompt
+// was supplied: the IDE's own is served to its worker, so this is the
+// plugin's own words in the same register.
+const LINGMA_SYS = "You are Lingma (灵码), an intelligent coding assistant created by the Alibaba Cloud technical team. You assist the user with coding tasks: answering questions, explaining code, and suggesting changes."
+
 const hexID = () => randomUUID().replaceAll("-", "")
 
 // ---- the COSY envelope --------------------------------------------------------
@@ -805,6 +810,24 @@ function lingmaMessages(messages) {
   return out
 }
 
+// lingmaUserInfo is the <user_info> block a Lingma prompt carries, filled
+// with the facts the collector wrote (the shape is the capture's). It says
+// what the collector says the IDE is: a plugin cannot know better, and the
+// deployment has no header that names it.
+function lingmaUserInfo(ctx = {}) {
+  const os = String(ctx?.os ?? "").trim()
+  const ide = String(ctx?.ide ?? "").trim()
+  const root = String(ctx?.workspace ?? "").trim()
+  const langs = Array.isArray(ctx?.workspaceLanguages) ? ctx.workspaceLanguages.filter((x) => typeof x === "string" && x.trim()) : []
+  const lines = []
+  if (os || ide) lines.push(`The user's OS version is ${os || "unknown"}.  The user's IDE is ${ide || "unknown"}.`)
+  if (root) lines.push(`The absolute path of the user's workspace is: ${root}`)
+  if (langs.length) lines.push(`The types of programming languages included in the user's workspace are as follows: ${langs.join(", ")}, etc.`)
+  if (!lines.length) return ""
+  lines.push("Please use this information as a reference but do not disclose it.")
+  return `<user_info>\n${lines.join("\n")}\n</user_info>`
+}
+
 // lingmaImageLines name an uploaded image in the prompt, as the IDE does:
 // "#image:<file name>", the name its upload was given.
 function lingmaImageLines(images) {
@@ -858,7 +881,7 @@ function lingmaBody(chat, m, named, site, images = [], ctx = {}) {
   // the deployment's own prompt, when the collector captured it: the IDE's is
   // served to its worker, not carried in the binary (no "You are Lingma" in
   // either exe), so it can only be injected, never rebuilt here
-  const baseSystem = String(ctx?.systemPrompt ?? "").trim() || site?.systemPrompt || QODER_SYS
+  const baseSystem = String(ctx?.systemPrompt ?? "").trim() || site?.systemPrompt || [LINGMA_SYS, lingmaUserInfo(ctx)].filter(Boolean).join("\n\n")
   const sysText = system ? baseSystem + "\n\n" + system : baseSystem
   const budget = chat.max_completion_tokens || chat.max_tokens || 0
   const [thinking] = effortFor(chat.reasoning_effort, m, typeof budget === "number" ? budget : 0)
@@ -4662,4 +4685,4 @@ export async function QwenWorkEnterpriseAuthPlugin({ client }) {
 export const protocol = { makePlugin, deviceSignIn, openapi, siteOf }
 
 // for tests
-export const _internal = { spentOf, OUTPUT_CAPS, LEARNED_CAPS, outputCap, fetchListing, accountIdentity, deviceRefreshBody, qwenworkClientHeaders, freeView, maskPhone, phoneLabelOf, realEmailOf, chatHeaders, machineOS, machineHostname, cosyHeaders, typedUnions, Splitter, campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, dedicatedOrigin, dedicatedHost, dedicatedSite, dedicatedSignIn, lingmaRoots, lingmaDecode, lingmaSite, lingmaHeaders, lingmaListing, lingmaJsonHeaders, LINGMA_MODELS_PATH, lingmaContext, LINGMA_CONTEXT_FILE, lingmaUploadImage, lingmaImages, lingmaImageUrls, chatImages, dataUrlBytes, LINGMA_UPLOAD_PATH, lingmaBody, lingmaMessages, lingmaImageLines, lingmaDerivedMachineIds, lingmaMachineIdFrom, lingmaAddSystemMark, lingmaVersion, lingmaMacs, fitLen, LINGMA_MODELS, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, kimiModel, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }
+export const _internal = { spentOf, OUTPUT_CAPS, LEARNED_CAPS, outputCap, fetchListing, accountIdentity, deviceRefreshBody, qwenworkClientHeaders, freeView, maskPhone, phoneLabelOf, realEmailOf, chatHeaders, machineOS, machineHostname, cosyHeaders, typedUnions, Splitter, campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, dedicatedOrigin, dedicatedHost, dedicatedSite, dedicatedSignIn, lingmaRoots, lingmaDecode, lingmaSite, lingmaHeaders, lingmaListing, lingmaJsonHeaders, LINGMA_MODELS_PATH, LINGMA_LISTINGS, lingmaContext, LINGMA_CONTEXT_FILE, lingmaUploadImage, lingmaImages, lingmaImageUrls, chatImages, dataUrlBytes, LINGMA_UPLOAD_PATH, lingmaBody, lingmaMessages, lingmaImageLines, lingmaUserInfo, LINGMA_SYS, lingmaDerivedMachineIds, lingmaMachineIdFrom, lingmaAddSystemMark, lingmaVersion, lingmaMacs, fitLen, LINGMA_MODELS, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, kimiModel, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }

@@ -43,6 +43,7 @@ beforeEach(() => {
   cosy = join(sandbox, "cosy")
   process.env.QODERCN_COSY_HOME = cosy
   seen = []
+  _internal.LINGMA_LISTINGS.clear()
   route = () => new Response("", { status: 404 })
   globalThis.fetch = async (input, init = {}) => {
     const u = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url)
@@ -487,4 +488,25 @@ test("a deployment's reserved-looking key (default) is taken, as Qoder's own wou
   const ask = { model: "default", messages: [{ role: "user", content: "hi" }] }
   expect((await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(ask) })).status).toBe(200)
   expect(JSON.parse(_internal.decodeBody(chats()[0].body)).model_config).toMatchObject({ key: "default", format: "dashscope", source: "system" })
+})
+
+test("with no captured prompt, the chat names the IDE the collector found, and never Qoder", async () => {
+  expect(_internal.lingmaUserInfo({})).toBe("")
+  ideCache(cosy, ACCOUNT())
+  writeFileSync(
+    join(cosy, _internal.LINGMA_CONTEXT_FILE),
+    JSON.stringify({ os: "windows 24H2", ide: "IntelliJ IDEA 2026.3", workspace: "D:\work\p", workspaceLanguages: ["shell", "SQL"] }),
+  )
+  route = (at) => (at === HOST + CHAT ? sse(OK) : new Response("", { status: 404 }))
+  const s = store(signedIn({ lingmaRoot: cosy }))
+  const opts = await (await QoderCNAuthPlugin({ client: s.client })).auth.loader(s.get)
+  const res = await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(ask) })
+  if (res.status !== 200) throw new Error(`status ${res.status}: ${await res.text()}`)
+  const sys = JSON.parse(_internal.decodeBody(chats()[0].body)).messages[0].content
+  expect(sys).toContain("Lingma")
+  expect(sys).not.toContain("Qoder")
+  expect(sys).toContain("<user_info>")
+  expect(sys).toContain("The user's OS version is windows 24H2.  The user's IDE is IntelliJ IDEA 2026.3.")
+  expect(sys).toContain("D:\work\p")
+  expect(sys).toContain("shell, SQL, etc.")
 })
