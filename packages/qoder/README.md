@@ -370,16 +370,23 @@ It follows Qoder IDE 1.38.0's own rules for that setting:
 The rules come from Qoder IDE's code. This plugin has not been tried with a
 dedicated account.
 
-#### Lingma 1.0 dedicated domains (since 0.2.56)
+#### Lingma 1.0 dedicated domains (since 0.2.56; the 通义灵码 IDE plugin, a derived machine id, the domain's own model list, its body shape and its images since 0.2.72)
 
-A Lingma 1.0 domain has no device flow and takes no console PAT. Qoder CN
-IDE signs in to it through its own language server. So the plugin uses the
-account Qoder CN IDE is already signed in to on this computer:
+A Lingma 1.0 domain has no device flow and takes no console PAT. The IDE
+signs in to it through its own language server. So the plugin uses the
+account the IDE is already signed in to on this computer:
 
 1. Sign in to the dedicated domain once in Qoder CN IDE (Settings →
-   「企业版专属域登录」).
+   「企业版专属域登录」) or in the 通义灵码 IDE plugin.
 2. In magpie, choose **Sign in with Qoder CN Enterprise dedicated domain
    (企业版专属域)** and enter the same domain.
+
+A 通义灵码 private deployment (a self-hosted `…/algo` server) also answers
+the IDE's own version probe, which would otherwise read the domain as
+Qoder CN 2.0 and send it to the device flow it does not serve. Address such
+a domain as `lingma://your-corp.example.com` to say it is a Lingma
+deployment outright, whatever its probe answers; a bare host still goes by
+the probe.
 
 The plugin reads the IDE worker's cache, in its `SharedClientCache` folder:
 
@@ -389,16 +396,42 @@ The plugin reads the IDE worker's cache, in its `SharedClientCache` folder:
 | Windows | `%APPDATA%\QoderCN\SharedClientCache` |
 | Linux | `$XDG_CONFIG_HOME/QoderCN/SharedClientCache` (`~/.config/...`) |
 
-It also looks in `~/.config/Qoder CN/SharedClientCache` and `~/.lingma`, and
-`QODERCN_COSY_HOME` names another folder. `cache/id` is the machine id, and
-`cache/user` is the account, encrypted under that id.
+It also looks in `~/.config/Qoder CN/SharedClientCache`, `~/.lingma/shared_client`
+and `~/.lingma`, and `QODERCN_COSY_HOME` names another folder (`COSY_HOME`, the
+通义灵码 IDE plugin's own, too). `cache/id` is the machine id, and `cache/user`
+is the account, encrypted under that id.
+
+An IDE that never wrote `cache/id` still has a machine id: the one
+`GetMachineId` derives from the machine itself — `"%08x"` of the home
+volume's serial with the first 12 characters of an ethernet address, marked
+and rewritten as a uuid. So `cache/user` opens on such a machine too; the
+volume serial and the address can be named outright with `COSY_VOLUME_SERIAL`
+and `COSY_MAC`, and `COSY_MACHINE_ID` names the id itself. The `key` is the
+id's first 16 characters, so only the volume serial decides it.
 
 - Every call goes to the domain itself, signed as the IDE's worker signs
-  it: `Cosy-ClientType` 0, version 2.5.18, the assistant scene.
-- The models are the IDE's own: `qmodel_latest` (Qwen3.7-Max),
-  `dashscope_qmodel` (Qwen3.7-Plus) and `q36fmodel` (Qwen3.6-Flash). The
-  domain's own model list names keys its chat refuses. When the domain
-  answers "Model not exist" for a model, the next one is asked.
+  it: `Cosy-ClientType` 0, the assistant scene, and the version the IDE's own
+  `config.json` names (`cosy.core.version`; 2.5.18 when it names none).
+- The models are the domain's own: its `GET /algo/api/v2/model/list` `chat`
+  entries, cached for ten minutes and named with their own `format` and
+  `source` (`qwen3`, `glm-latest-coder`, …). When that list cannot be read
+  the IDE's three are used (`qmodel_latest`, `dashscope_qmodel`,
+  `q36fmodel`). When the domain answers "Model not exist" for a model, the
+  next one is asked.
+- The request is the IDE's own shape, not Qoder's: `chat_context`,
+  `chat_prompt`, `image_urls`, `is_reply`/`is_retry`, `source`, `version`,
+  `chat_task`, `agent_id` (`agent_chat`), `task_id` (`common_chat`) and
+  `aliyun_user_type` (the cache's `user_type`), with `messages` carrying
+  string contents. `parameters` is still sent (the capture has `null`) so a
+  `max_tokens` above the model's ceiling is clamped as on Qoder; the
+  workspace fields (`workspaceLanguages`, `activeFilePath`, `code_language`)
+  are left empty, as a plugin cannot know the IDE's.
+- Images are taken: a `data:` URL is first PUT to the deployment's own
+  `/algo/api/v2/image/upload` (multipart, one `file` part, the envelope
+  signing the body's *length*) and the url it answers is named in the
+  request's `image_urls` and `chat_context.imageUrls`, as the IDE does. An
+  http address is named as it is. The IDE does this on models whose listing
+  says `is_vl: false`, so all three take an image.
 - The IDE renews its sign-in itself, and the plugin reads the cache again
   near the token's end, or when the domain refuses it (105). When the IDE
   holds nothing newer, the account is marked expired: open Qoder CN IDE so

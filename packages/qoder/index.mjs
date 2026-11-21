@@ -38,7 +38,7 @@ import { createCipheriv, createDecipheriv, createHash, publicEncrypt, randomByte
 import { execFile } from "node:child_process"
 import { readFile, readdir, stat } from "node:fs/promises"
 import { STATUS_CODES } from "node:http"
-import { homedir, hostname } from "node:os"
+import { homedir, hostname, networkInterfaces } from "node:os"
 import { join, resolve } from "node:path"
 import { domainToASCII } from "node:url"
 
@@ -397,13 +397,16 @@ async function dedicatedProbe(origin) {
 
 // dedicatedSignIn reads the domain as the IDE does and starts its device
 // sign-in. A Lingma 1.0 domain (404 at the probe) is signed in to with the
-// account Qoder CN IDE holds for it (lingmaSignIn). The chat host is the
-// gateway host when it answers at all, else the domain's own origin, which
-// answered the probe on the same /algo path; the IDE leaves this to its
-// language server, whose rule wasn't read (inferred).
+// account the IDE holds for it (lingmaSignIn). A domain whose address is
+// given as lingma://<domain> is a Lingma deployment outright, whatever its
+// probe says: a 通义灵码 private deployment answers /algo/api/v1/version with
+// its own version, which the probe would otherwise read as Qoder CN 2.0.
 async function dedicatedSignIn(site, input) {
-  const origin = dedicatedOrigin(input)
+  const said = String(input ?? "").trim()
+  const forced = /^(?:lingma|cosy):\/\//i.test(said)
+  const origin = dedicatedOrigin(said.replace(/^(?:lingma|cosy):\/\//i, ""))
   if (!origin) throw new Error(`Not a dedicated domain: ${String(input ?? "").slice(0, 100)}`)
+  if (forced) return lingmaSignIn(site, origin)
   const status = await dedicatedProbe(origin)
   if (status === undefined) throw new Error(`${site.name}: ${origin} didn't answer (${DEDICATED_VERSION}); check the address and your network`)
   if (status === 404) return lingmaSignIn(site, origin)
@@ -452,50 +455,158 @@ const LINGMA_MODELS = [
 const LINGMA_LAPSED = /"code"\s*:\s*"?105"?|Login (?:expired|timeout)/i
 const LINGMA_NOT_HERE = /model_not_found|Model not exist/i
 
-// lingmaRoots is where Qoder CN IDE's worker keeps its cache on this
-// system: QODERCN_COSY_HOME first, then the IDE's own folder, then the
-// older layouts. HOME is read first, so a sandboxed HOME is the one
-// looked in.
+// lingmaRoots is where the Lingma worker keeps its cache on this system:
+// QODERCN_COSY_HOME first, then COSY_HOME (the 通义灵码 IDE plugin's own env
+// var, cosy/util.GetCosyHomePath), then the IDE's own folder, then the older
+// layouts. HOME is read first, so a sandboxed HOME is the one looked in.
 function lingmaRoots(env = process.env, platform = process.platform, home = env.HOME || env.USERPROFILE || homedir()) {
   const roots = []
   const add = (p) => p && !roots.includes(p) && roots.push(p)
   add(String(env.QODERCN_COSY_HOME ?? "").trim())
+  add(String(env.COSY_HOME ?? "").trim())
   if (platform === "darwin") add(join(home, "Library", "Application Support", "QoderCN", "SharedClientCache"))
   else if (platform === "win32") add(join(env.APPDATA || join(home, "AppData", "Roaming"), "QoderCN", "SharedClientCache"))
   else add(join(env.XDG_CONFIG_HOME || join(home, ".config"), "QoderCN", "SharedClientCache"))
   add(join(home, ".config", "QoderCN", "SharedClientCache"))
   add(join(home, ".config", "Qoder CN", "SharedClientCache"))
+  // the desktop client's qoder mode keeps its worker under shared_client,
+  // the IDE plugin writes straight into .lingma
+  add(join(home, ".lingma", "shared_client"))
   add(join(home, ".lingma"))
   return roots
 }
 
+// fitLen is cosy/util.fitLength: s cut to n, or s repeated until it reaches n.
+function fitLen(s, n) {
+  if (s.length >= n) return s.slice(0, n)
+  if (!s.length) return ""
+  return s.repeat(Math.ceil(n / s.length)).slice(0, n)
+}
+
+// lingmaAddSystemMark is cosy/util.addSystemMark @0x14064f740. The "w" is a
+// literal in its format string ("%s-%sw%s-%s", 0x141e95418), not a typo.
+const lingmaAddSystemMark = (s) => `${s.slice(0, 7)}-${s.slice(7, 10)}w${s.slice(10, 13)}-${s.slice(13)}`
+
+// lingmaMachineIdFrom is cosy/util.encodeAndSaveMachineId: the marked string's
+// first 16 bytes as hex, with uuid.NewRandomFromReader's version and variant
+// bits rewritten, as a 36-char uuid.
+function lingmaMachineIdFrom(volumeSerial, mac) {
+  const s = fitLen(volumeSerial, 8) + fitLen(mac, 12)
+  const b = Buffer.from(lingmaAddSystemMark(s).slice(0, 16), "latin1")
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const h = b.toString("hex")
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+// lingmaVolumeSerial is "%08x" of the serial of the volume the IDE lives on
+// (cosy/util.getDiskSerialNumber reads it from the running executable's
+// volume, which sits under the user's home).
+async function lingmaVolumeSerial(home, platform = process.platform, run = execFile) {
+  const forced = String(process.env.COSY_VOLUME_SERIAL ?? "").trim()
+  if (forced) return forced.toLowerCase().replace(/[^0-9a-f]/g, "").padStart(8, "0")
+  if (platform !== "win32") return ""
+  const drive = (/^[A-Za-z]:/.test(home) ? home.slice(0, 2) : process.env.SystemDrive || "C:").toUpperCase()
+  const out = await new Promise((done) => {
+    run("cmd", ["/d", "/c", "vol", drive], { windowsHide: true }, (err, stdout) => done(err ? "" : String(stdout)))
+  })
+  const m = out.match(/([0-9A-Fa-f]{4})-([0-9A-Fa-f]{4})/)
+  return m ? (m[1] + m[2]).toLowerCase() : ""
+}
+
+// lingmaMacs are the machine's ethernet hardware addresses, lowercase and
+// colon-separated, as cosy/util.getMacAddress formats them. Every one is a
+// candidate: the IDE takes its first non-loopback ethernet interface, whose
+// order the OS decides.
+function lingmaMacs(ifaces = networkInterfaces()) {
+  const out = []
+  const forced = String(process.env.COSY_MAC ?? "").trim()
+  if (forced) return [forced.toLowerCase().replace(/-/g, ":")]
+  for (const [name, addrs] of Object.entries(ifaces ?? {})) {
+    if (/^(lo|loopback)/i.test(name)) continue
+    for (const a of addrs ?? []) {
+      const mac = String(a?.mac ?? "").toLowerCase()
+      if (!mac || mac === "00:00:00:00:00:00" || a?.internal) continue
+      if (mac.split(":").length !== 6) continue
+      if (!out.includes(mac)) out.push(mac)
+    }
+  }
+  return out
+}
+
+// lingmaDerivedMachineIds are the machine ids cosy/util.GetMachineId makes
+// when the IDE never wrote cache/id: the volume serial and MAC pair, in the
+// IDE's own marking. Empty when neither source is readable.
+//
+// Every address is a candidate because the IDE takes the first ethernet one
+// and the OS decides that order. Which one is picked only changes the id sent
+// in Cosy-MachineId: the AES key (the id's first 16 characters) is built from
+// the volume serial alone, so any of them opens cache/user.
+async function lingmaDerivedMachineIds(home) {
+  const forced = String(process.env.COSY_MACHINE_ID ?? "").trim()
+  if (forced) return [forced]
+  const serial = await lingmaVolumeSerial(home)
+  if (!serial) return []
+  return lingmaMacs().map((mac) => lingmaMachineIdFrom(serial, mac))
+}
+
+// lingmaVersion is the version the IDE writes in its config.json, so a
+// dedicated domain sees the version its own client sends (2.5.11, 2.5.18, …).
+async function lingmaVersion(root) {
+  let cfg
+  try {
+    cfg = JSON.parse(await readFile(join(root, "config.json"), "utf8"))
+  } catch {
+    return ""
+  }
+  const v = cfg?.["cosy.core.version"] ?? cfg?.cosy?.core?.version
+  return typeof v === "string" ? v.trim() : ""
+}
+
 // lingmaDecode is the account one cosyHome holds, or why there is none.
+// cache/id names the machine id; an IDE that never wrote it has one derived
+// from the machine, as GetMachineId does, and cache/user is opened with it.
 async function lingmaDecode(root) {
   const read = async (p) => (await readFile(p, "utf8").catch(() => "")).trim()
-  const id = (await read(join(root, "cache", "id"))) || (await read(join(root, "id")))
   const blob = await read(join(root, "cache", "user"))
-  if (!id || !blob) return { root, reason: "no cache/id and cache/user" }
-  const key = Buffer.from(id.slice(0, 16), "utf8")
-  if (key.length !== 16) return { root, reason: "the machine id is too short" }
+  const id = (await read(join(root, "cache", "id"))) || (await read(join(root, "id")))
+  if (!blob) return { root, reason: id ? "no cache/user" : "no cache/id and cache/user" }
+  const ids = id ? [id] : await lingmaDerivedMachineIds(root)
+  if (!ids.length) return { root, reason: "no cache/id and none could be derived from this machine" }
   let a
-  try {
-    const d = createDecipheriv("aes-128-cbc", key, key)
-    a = JSON.parse(Buffer.concat([d.update(Buffer.from(blob, "base64")), d.final()]).toString("utf8"))
-  } catch {
-    return { root, reason: "cache/user doesn't open with the machine id" }
+  let machineId = ""
+  const reasons = []
+  for (const mid of ids) {
+    const key = Buffer.from(mid.slice(0, 16), "utf8")
+    if (key.length !== 16) {
+      reasons.push("the machine id is too short")
+      continue
+    }
+    try {
+      const d = createDecipheriv("aes-128-cbc", key, key)
+      a = JSON.parse(Buffer.concat([d.update(Buffer.from(blob, "base64")), d.final()]).toString("utf8"))
+      machineId = mid
+      break
+    } catch {
+      a = undefined
+    }
   }
+  if (!a) return { root, reason: reasons[0] ?? (id ? "cache/user doesn't open with the machine id" : "cache/user doesn't open with a derived machine id") }
   const access = String(a?.security_oauth_token ?? "").trim()
   const uid = String(a?.uid ?? "").trim()
   if (!access || !uid) return { root, reason: "cache/user names no signed-in account" }
   const end = Number(a.expire_time)
   return {
     root,
-    machineId: id,
+    machineId,
+    derivedMachineId: !id,
+    version: await lingmaVersion(root),
     uid,
     access,
     email: String(a.email ?? ""),
     name: String(a.name ?? ""),
     orgId: String(a.organization_id ?? ""),
+    userType: String(a.user_type ?? ""),
     expires: Number.isFinite(end) && end > 0 ? end : 0,
   }
 }
@@ -510,7 +621,7 @@ async function lingmaRead(site, roots = lingmaRoots()) {
     seen.push(`${root}: ${got.reason}`)
   }
   return new SignInGone(
-    `${site.name}: no Qoder CN IDE sign-in found on this computer. Sign in to your dedicated domain once in Qoder CN IDE (Settings → 企业版专属域登录), then sign in here again. Looked in ${seen.join("; ")}`,
+    `${site.name}: no Lingma IDE sign-in found on this computer. Sign in to your dedicated domain once in Qoder CN IDE (Settings → 企业版专属域登录) or in the 通义灵码 IDE plugin, then sign in here again. Looked in ${seen.join("; ")}`,
     true,
   )
 }
@@ -537,6 +648,8 @@ function lingmaAccount(site, origin, got) {
     deviceRefresh: "",
     dedicated: host,
     lingma: true,
+    ...(got.version ? { lingmaVersion: got.version } : {}),
+    ...(got.userType ? { lingmaUserType: got.userType } : {}),
   }
 }
 
@@ -548,12 +661,12 @@ async function lingmaSignIn(site, origin, roots) {
   if (got instanceof Error) throw got
   if (!lingmaLive(got))
     throw new SignInGone(
-      `${site.name}: Qoder CN IDE's sign-in (${got.email || got.uid}) ended ${new Date(got.expires).toISOString()}; open Qoder CN IDE so it signs in again, then sign in here again`,
+      `${site.name}: the Lingma IDE's sign-in (${got.email || got.uid}) ended ${new Date(got.expires).toISOString()}; open Qoder CN IDE or the 通义灵码 IDE so it signs in again, then sign in here again`,
       true,
     )
   return {
     url: origin,
-    instructions: `${new URL(origin).host} is a Lingma 1.0 (通义灵码) dedicated domain: using the account Qoder CN IDE is signed in to (${got.email || got.uid})`,
+    instructions: `${new URL(origin).host} is a Lingma 1.0 (通义灵码) dedicated domain: using the account the Lingma IDE on this computer is signed in to (${got.email || got.uid})`,
     method: "auto",
     async callback() {
       return lingmaAccount(site, origin, got)
@@ -574,8 +687,9 @@ async function lingmaRenew(site, a, roots) {
 }
 
 // lingmaSite is site served from a Lingma 1.0 domain: every call on its
-// own origin, signed as the IDE's worker signs them.
-function lingmaSite(site, domain) {
+// own origin, signed as the IDE's worker signs them. version is the one the
+// IDE's config.json names, so the domain sees its own client's version.
+function lingmaSite(site, domain, version) {
   const origin = dedicatedOrigin(domain)
   if (!origin) return undefined
   const host = new URL(origin).host
@@ -588,7 +702,7 @@ function lingmaSite(site, domain) {
     dedicated: host,
     lingma: true,
     clientType: "0",
-    cosyVersion: LINGMA_VERSION,
+    cosyVersion: version || LINGMA_VERSION,
     modelScene: "assistant",
     sessionType: "assistant",
   }
@@ -604,8 +718,236 @@ function lingmaHeaders(url, u, body, site) {
   return { ...h, Accept: "text/event-stream", "Cache-Control": "no-cache", "x-request-id": randomUUID() }
 }
 
-// lingmaModel is a Lingma model as a request carries it
-const lingmaModel = (m) => modelInfo({ key: m.key, display_name: m.name, format: "dashscope", source: "system", max_input_tokens: 180_000 })
+// lingmaModel is a Lingma model as a request carries it. Images are taken:
+// the IDE uploads one and names it in the request's image_urls (a deployment
+// answered a vision question on a model whose listing says is_vl: false).
+const lingmaModel = (m) => modelInfo({ key: m.key, display_name: m.name, format: "dashscope", source: "system", max_input_tokens: 180_000, images: true })
+
+// LINGMA_MODELS_PATH is the deployment's own model list, as its IDE reads it:
+// GET, the account's envelope, answering { chat: [ { key, format, source,
+// display_name, is_vl, max_input_tokens, … } ], developer: […], … }.
+const LINGMA_MODELS_PATH = "/algo/api/v2/model/list"
+const LINGMA_LISTING_TTL = 10 * 60 * 1000
+const LINGMA_LISTINGS = new Map()
+
+// lingmaJsonHeaders are a plain GET's headers, as the IDE sends the list's:
+// the envelope with no scene or business headers, and application/json.
+function lingmaJsonHeaders(url, u, site) {
+  const h = cosyHeaders(url, u, "", site)
+  delete h["Cosy-Scene"]
+  delete h["Cosy-Business-Product"]
+  delete h["Cosy-Business-Type"]
+  return { ...h, Accept: "application/json" }
+}
+
+// lingmaListing is the deployment's models: its own list's "chat" entries,
+// cached for a while per origin. LINGMA_MODELS when the list cannot be read
+// (the deployment's keys are what its chat takes, so these are the fallback).
+async function lingmaListing(site, u) {
+  const at = site.api
+  const hit = LINGMA_LISTINGS.get(at)
+  if (hit && Date.now() - hit.at < LINGMA_LISTING_TTL) return hit.list
+  const list = []
+  try {
+    const url = at + LINGMA_MODELS_PATH
+    const r = await fetch(url, { headers: lingmaJsonHeaders(url, u, site) })
+    if (r.ok) {
+      const said = await r.json().catch(() => null)
+      for (const raw of Array.isArray(said?.chat) ? said.chat : []) {
+        if (!raw?.key) continue
+        // the IDE sends an image on a model its list calls is_vl: false too
+        list.push({ ...modelInfo(raw), images: true })
+      }
+    }
+  } catch {}
+  if (!list.length) return LINGMA_MODELS.map(lingmaModel)
+  LINGMA_LISTINGS.set(at, { at: Date.now(), list })
+  return list
+}
+
+// LINGMA_UPLOAD_PATH is where the IDE puts an image before a chat names it:
+// PUT multipart/form-data, one "file" part, answering { result: { url } }.
+const LINGMA_UPLOAD_PATH = "/algo/api/v2/image/upload"
+
+// lingmaMessages are a chat's turns as the IDE writes them: a content is a
+// plain string (not parts), a tool turn names the call it answers, and tool
+// calls stay OpenAI's.
+function lingmaMessages(messages) {
+  const out = []
+  for (const m of messages ?? []) {
+    const role = m?.role
+    if (!role || role === "system" || role === "developer") continue
+    const content = textOf(m.content)
+    if (role === "tool") {
+      out.push({ role: "tool", content, ...(m.name ? { name: String(m.name) } : {}), ...(m.tool_call_id ? { tool_call_id: String(m.tool_call_id) } : {}) })
+      continue
+    }
+    if (role === "assistant") {
+      const calls = Array.isArray(m.tool_calls) ? m.tool_calls.filter((t) => t?.function?.name) : []
+      out.push({
+        role: "assistant",
+        content,
+        ...(calls.length
+          ? {
+              tool_calls: calls.map((t) => ({
+                id: String(t.id ?? ""),
+                type: "function",
+                function: { name: t.function.name, arguments: typeof t.function.arguments === "string" ? t.function.arguments : JSON.stringify(t.function.arguments ?? {}) },
+              })),
+            }
+          : {}),
+      })
+      continue
+    }
+    out.push({ role: "user", content })
+  }
+  return out
+}
+
+// lingmaImageLines name an uploaded image in the prompt, as the IDE does:
+// "#image:<file name>", the name its upload was given.
+function lingmaImageLines(images) {
+  return images.map((x) => (x.name ? `#image:${x.name}` : "")).filter(Boolean)
+}
+
+// lingmaBody is agent_chat_generation in the shape a Lingma 1.0 deployment
+// takes it (2026-11-20 capture): chat_context/chat_prompt/image_urls beside
+// the turns, is_reply/is_retry, source/version/chat_task, the IDE's own
+// agent and task ids, and model_config as its listing names it. parameters is
+// kept (the capture says null, the model's own defaults); the rest of the
+// values the IDE sends but a plugin cannot know (workspace languages, the
+// active file, code language) are left empty.
+function lingmaBody(chat, m, named, site, images = []) {
+  const turns = lingmaMessages(chat.messages)
+  const said = (() => {
+    for (let i = turns.length - 1; i >= 0; i--) if (turns[i].role === "user") return turns[i].content
+    return ""
+  })()
+  const system = (chat.messages ?? []).filter((x) => x.role === "system" || x.role === "developer").map((x) => textOf(x.content)).filter(Boolean).join("\n\n")
+  const baseSystem = site?.systemPrompt ?? QODER_SYS
+  const sysText = system ? baseSystem + "\n\n" + system : baseSystem
+  const budget = chat.max_completion_tokens || chat.max_tokens || 0
+  const [thinking] = effortFor(chat.reasoning_effort, m, typeof budget === "number" ? budget : 0)
+  const asked = chat.max_completion_tokens || chat.max_tokens || 32000
+  const cap = outputCap(m)
+  const params = { enable_thinking: thinking, max_tokens: cap > 0 && asked > cap ? cap : asked }
+  const window = windowFor(chat, m, params.max_tokens)
+  if (window > 0) params.context_length = window
+  const lines = lingmaImageLines(images)
+  const urls = images.map((x) => x.url)
+  const prompt = lines.length ? `\n用户上下文:\n\n${lines.join("\n")}\n\n\n\n问题：\n${said}` : ""
+  const record = randomUUID()
+  const body = {
+    request_id: randomUUID(),
+    request_set_id: record,
+    chat_record_id: record,
+    stream: true,
+    chat_task: "FREE_INPUT",
+    chat_context: {
+      text: said ? said + "\n" : "",
+      workspaceLanguages: [],
+      language: "",
+      localeLang: "zh",
+      preferredLanguage: "zh",
+      features: [],
+      activeFilePath: "",
+      chatPrompt: prompt,
+      imageUrls: urls.length ? urls : null,
+    },
+    image_urls: urls.length ? urls : null,
+    is_reply: false,
+    is_retry: false,
+    session_id: sessionOf(chat, named),
+    code_language: "",
+    source: 1,
+    version: "3",
+    chat_prompt: prompt,
+    parameters: params,
+    aliyun_user_type: site?.lingmaUserType ?? "",
+    session_type: site?.sessionType ?? "assistant",
+    agent_id: "agent_chat",
+    task_id: "common_chat",
+    model_config: modelConfig(m, thinking, true),
+    messages: [{ role: "system", content: sysText }, ...turns],
+  }
+  const tools = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function" && t.function?.name) : []
+  if (tools.length)
+    body.tools = tools.map((t) => ({
+      type: "function",
+      function: { name: t.function.name, description: t.function.description ?? "", parameters: typedUnions(t.function.parameters) ?? { type: "object", properties: {} } },
+    }))
+  return body
+}
+
+
+// chatImages are the image_url parts a chat carries, in order.
+function chatImages(chat) {
+  const out = []
+  for (const m of chat?.messages ?? []) {
+    if (!Array.isArray(m.content)) continue
+    for (const p of m.content) {
+      if (p?.type !== "image_url") continue
+      const url = typeof p.image_url === "string" ? p.image_url : p.image_url?.url
+      if (url) out.push(String(url))
+    }
+  }
+  return out
+}
+
+// dataUrlBytes is a data: URL as bytes and a file name the IDE's upload takes;
+// null for anything else (an http address is passed through as it is).
+function dataUrlBytes(url) {
+  const m = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(String(url))
+  if (!m) return null
+  const mime = m[1] || "application/octet-stream"
+  const bytes = m[2] ? Buffer.from(m[3], "base64") : Buffer.from(decodeURIComponent(m[3]))
+  const ext = (mime.split("/")[1] || "bin").replace(/[^a-z0-9]/gi, "").slice(0, 8) || "bin"
+  return { bytes, mime, name: `${randomUUID().replace(/-/g, "").slice(0, 8)}.${ext}` }
+}
+
+// lingmaUploadImage PUTs one image as the IDE does and answers the url the
+// chat names. The envelope signs the body's LENGTH, not the body: an image is
+// megabytes, and getAuthSignature is handed strconv.FormatInt(len, 10).
+async function lingmaUploadImage(site, u, bytes, name) {
+  const boundary = randomBytes(24).toString("hex")
+  const head = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: application/octet-stream\r\n\r\n`, "utf8")
+  const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8")
+  const payload = Buffer.concat([head, bytes, tail])
+  const url = site.api + LINGMA_UPLOAD_PATH + "?request_id=" + randomUUID().replace(/-/g, "")
+  const h = cosyHeaders(url, u, String(payload.length), site)
+  delete h["Cosy-Scene"]
+  delete h["Cosy-Business-Product"]
+  delete h["Cosy-Business-Type"]
+  const headers = { ...h, Accept: "application/json", "Accept-Encoding": "identity", "Content-Type": `multipart/form-data; boundary=${boundary}` }
+  const r = await fetch(url, { method: "PUT", headers, body: payload })
+  const said = await r.text().catch(() => "")
+  if (!r.ok) throw new Error(`image upload: status ${r.status}: ${said.trim().slice(0, 300)}`)
+  let saidUrl
+  try {
+    saidUrl = JSON.parse(said)?.result?.url
+  } catch {}
+  if (!saidUrl) throw new Error(`image upload: no url in the answer: ${said.trim().slice(0, 300)}`)
+  return String(saidUrl)
+}
+
+// lingmaImages are the chat's images as the deployment wants them: each
+// data: URL uploaded first (the url it answered, and the name it was given),
+// every other address (an http one) as it is.
+async function lingmaImages(site, u, chat) {
+  const out = []
+  for (const url of chatImages(chat)) {
+    const local = dataUrlBytes(url)
+    if (!local) {
+      out.push({ url, name: "" })
+      continue
+    }
+    out.push({ url: await lingmaUploadImage(site, u, local.bytes, local.name), name: local.name })
+  }
+  return out
+}
+
+// lingmaImageUrls are just their urls.
+const lingmaImageUrls = async (site, u, chat) => (await lingmaImages(site, u, chat)).map((x) => x.url)
 
 // siteOf is the site an account is served from: its VPC instance's when it
 // was signed in to one, else site. An instance on record that names none
@@ -621,9 +963,9 @@ function siteOf(site, a) {
     return { ...site, web: base, openapi: base, api: base, vpc: a.enterpriseHost, redirect: "" }
   }
   if (a?.dedicated && a.lingma) {
-    const s = lingmaSite(site, a.dedicated)
+    const s = lingmaSite(site, a.dedicated, a.lingmaVersion)
     if (!s) throw new SignInGone(`${site.name}: the account's dedicated domain "${a.dedicated}" isn't one; sign in again`)
-    return s
+    return { ...s, lingmaUserType: a.lingmaUserType ?? "" }
   }
   if (a?.dedicated) {
     const s = dedicatedSite(site, a.dedicated, a.dedicatedApi)
@@ -1470,10 +1812,12 @@ function typedUnions(schema) {
 // is the likely cause, not confirmed on a Qoder CN account.
 // A model with no key of its own is refused: Qoder's worker sends a
 // request with none as "auto", which is never what was asked for.
-function modelConfig(m, thinking) {
+function modelConfig(m, thinking, reserved = false) {
   const raw = m.config ?? {}
   const key = String(raw.key ?? m.key ?? "").trim()
-  if (!key || ["auto", "default"].includes(key) || key !== m.key) throw new Error(`no Qoder model key for "${m.key ?? ""}"`)
+  // "auto" and "default" are Qoder's own to refuse: a Lingma deployment's list
+  // names "default" (qwen3) as a model its chat takes.
+  if (!key || (!reserved && ["auto", "default"].includes(key)) || key !== m.key) throw new Error(`no Qoder model key for "${m.key ?? ""}"`)
   const max = Number.isInteger(raw.max_input_tokens) && raw.max_input_tokens > 0 ? raw.max_input_tokens : 200_000
   return {
     key,
@@ -3908,12 +4252,22 @@ const makePlugin = (site) => async ({ client }) => {
   // asked again once with the token the IDE renewed meanwhile.
   const askLingma = async (chat, cred, init, named, getAuth, asked) => {
     asked.cred = cred
-    const list = LINGMA_MODELS.map(lingmaModel)
+    const list = await lingmaListing(siteOf(site, cred), cred)
     const want = list.find((x) => x.key === chat.model)
     if (!want) return errorResponse({ status: 400, message: `unknown model "${chat.model}"; this dedicated domain serves ${list.map((x) => x.key).join(", ")}` })
     const order = [want, ...list.filter((x) => x !== want)]
     const task = taskOf(sessionOf(chat, named), chat)
     const tools = chat.tool_choice !== "none" ? (chat.tools ?? []).filter((t) => t?.type === "function") : []
+    // the chat's images go up once, before any model is asked: a retry on the
+    // next model names the same urls
+    let images = []
+    if (chatImages(chat).length) {
+      try {
+        images = await lingmaImages(siteOf(site, cred), cred, chat)
+      } catch (e) {
+        return errorResponse({ status: 502, message: e?.message ?? String(e) })
+      }
+    }
     let relogged = false
     let reclamped = false
     for (let i = 0; ; ) {
@@ -3922,7 +4276,7 @@ const makePlugin = (site) => async ({ client }) => {
       const url = s.api + CHAT_PATH
       let body
       try {
-        body = qoderBody(chat, m, named, task, s)
+        body = lingmaBody(chat, m, named, s, images)
       } catch (e) {
         return errorResponse({ status: 400, message: e?.message ?? String(e) })
       }
@@ -4274,4 +4628,4 @@ export async function QwenWorkEnterpriseAuthPlugin({ client }) {
 export const protocol = { makePlugin, deviceSignIn, openapi, siteOf }
 
 // for tests
-export const _internal = { spentOf, OUTPUT_CAPS, LEARNED_CAPS, outputCap, fetchListing, accountIdentity, deviceRefreshBody, qwenworkClientHeaders, freeView, maskPhone, phoneLabelOf, realEmailOf, chatHeaders, machineOS, machineHostname, cosyHeaders, typedUnions, Splitter, campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, dedicatedOrigin, dedicatedHost, dedicatedSite, lingmaRoots, lingmaDecode, lingmaSite, lingmaHeaders, LINGMA_MODELS, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, kimiModel, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }
+export const _internal = { spentOf, OUTPUT_CAPS, LEARNED_CAPS, outputCap, fetchListing, accountIdentity, deviceRefreshBody, qwenworkClientHeaders, freeView, maskPhone, phoneLabelOf, realEmailOf, chatHeaders, machineOS, machineHostname, cosyHeaders, typedUnions, Splitter, campaignRuntime, RUNTIMES, campaignPage, campaignTarget, vpcInstance, vpcSite, dedicatedOrigin, dedicatedHost, dedicatedSite, dedicatedSignIn, lingmaRoots, lingmaDecode, lingmaSite, lingmaHeaders, lingmaListing, lingmaJsonHeaders, LINGMA_MODELS_PATH, lingmaUploadImage, lingmaImages, lingmaImageUrls, chatImages, dataUrlBytes, LINGMA_UPLOAD_PATH, lingmaBody, lingmaMessages, lingmaImageLines, lingmaDerivedMachineIds, lingmaMachineIdFrom, lingmaAddSystemMark, lingmaVersion, lingmaMacs, fitLen, LINGMA_MODELS, parseUsage, gfmt, when, failure, modelInfo, qoderBody, qoderMessages, kimiModel, cacheMarked, sessionOf, namedSession, taskOf, TASKS, TASK_MAX, TASK_IDLE, SESSION, SITES, decodeBody, events, QUEUE, queueState }

@@ -12,7 +12,7 @@
 //   inside the stream.
 // Nothing here reaches the network: fetch is answered in-process.
 import { afterAll, afterEach, beforeAll, beforeEach, expect, test } from "bun:test"
-import { createCipheriv } from "node:crypto"
+import { createCipheriv, createHash } from "node:crypto"
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -47,7 +47,8 @@ beforeEach(() => {
   globalThis.fetch = async (input, init = {}) => {
     const u = new URL(typeof input === "string" ? input : input instanceof URL ? input.href : input.url)
     const body = typeof init.body === "string" ? init.body : ""
-    seen.push({ host: u.host, path: u.pathname, search: u.search, headers: new Headers(init.headers), body })
+    const bodyLength = init.body instanceof Uint8Array ? init.body.length : Buffer.byteLength(body)
+    seen.push({ method: init.method ?? "GET", host: u.host, path: u.pathname, search: u.search, headers: new Headers(init.headers), body, bodyLength })
     return route(u.host + u.pathname, { body, headers: new Headers(init.headers) })
   }
 })
@@ -117,7 +118,84 @@ test("the IDE's cache is looked for where Qoder CN IDE keeps it on each system, 
   expect(_internal.lingmaRoots({}, "win32", home)[0]).toBe(join(home, "AppData", "Roaming", "QoderCN", "SharedClientCache"))
   expect(_internal.lingmaRoots({ XDG_CONFIG_HOME: "/x" }, "linux", home)[0]).toBe(join("/x", "QoderCN", "SharedClientCache"))
   const linux = _internal.lingmaRoots({}, "linux", home)
-  expect(linux).toEqual([join(home, ".config", "QoderCN", "SharedClientCache"), join(home, ".config", "Qoder CN", "SharedClientCache"), join(home, ".lingma")])
+  expect(linux).toEqual([join(home, ".config", "QoderCN", "SharedClientCache"), join(home, ".config", "Qoder CN", "SharedClientCache"), join(home, ".lingma", "shared_client"), join(home, ".lingma")])
+  // COSY_HOME is the 通义灵码 IDE plugin's own, ahead of the folders it writes
+  expect(_internal.lingmaRoots({ COSY_HOME: "/c" }, "win32", home).slice(0, 2)).toEqual(["/c", join(home, "AppData", "Roaming", "QoderCN", "SharedClientCache")])
+})
+
+// The vector is a real Windows deployment: its traffic's Cosy-Machineid was
+// 36653133-6238-452d-a566-65773a66632d and it had no cache/id at all.
+test("a machine id the IDE never wrote is derived as GetMachineId derives it", () => {
+  expect(_internal.lingmaMachineIdFrom("6e13b8ee", "fe:fc:aa:bb:cc:dd")).toBe("36653133-6238-452d-a566-65773a66632d")
+  // the "w" in addSystemMark is a literal, the rest of the marking is dashes
+  expect(_internal.lingmaAddSystemMark("6e13b8eefe:fc:aa:bb:")).toBe("6e13b8e-efew:fc-:aa:bb:")
+  // fitLength cuts past its length and repeats short inputs to reach it
+  expect(_internal.fitLen("6e13b8ee", 8)).toBe("6e13b8ee")
+  expect(_internal.fitLen("fe:fc:aa:bb:cc:dd", 12)).toBe("fe:fc:aa:bb:")
+  expect(_internal.fitLen("ab", 5)).toBe("ababa")
+})
+
+test("a cache with no cache/id opens under the machine id derived from the volume and MAC", async () => {
+  const savedVol = process.env.COSY_VOLUME_SERIAL
+  const savedMac = process.env.COSY_MAC
+  process.env.COSY_VOLUME_SERIAL = "6e13b8ee"
+  process.env.COSY_MAC = "fe:fc:aa:bb:cc:dd"
+  try {
+    const root = join(sandbox, "derived")
+    // the IDE wrote cache/user but never cache/id
+    mkdirSync(join(root, "cache"), { recursive: true })
+    const id = "36653133-6238-452d-a566-65773a66632d"
+    const key = Buffer.from(id.slice(0, 16), "utf8")
+    const c = createCipheriv("aes-128-cbc", key, key)
+    writeFileSync(join(root, "cache", "user"), Buffer.concat([c.update(JSON.stringify(ACCOUNT()), "utf8"), c.final()]).toString("base64"))
+
+    const got = await _internal.lingmaDecode(root)
+    expect(got.machineId).toBe(id)
+    expect(got.derivedMachineId).toBe(true)
+    expect(got.access).toBe(ACCOUNT().security_oauth_token)
+
+    // key = machineId[:16] is built from the volume serial alone (b0..b6), so
+    // a wrong MAC still opens it; a wrong volume serial is what fails
+    process.env.COSY_MAC = "aa:bb:cc:dd:ee:ff"
+    expect((await _internal.lingmaDecode(root)).machineId).toBe("36653133-6238-452d-a561-61773a62622d")
+    process.env.COSY_VOLUME_SERIAL = "12345678"
+    const wrong = await _internal.lingmaDecode(root)
+    expect(wrong.reason).toContain("derived machine id")
+  } finally {
+    for (const [k, v] of [["COSY_VOLUME_SERIAL", savedVol], ["COSY_MAC", savedMac]]) v === undefined ? delete process.env[k] : (process.env[k] = v)
+  }
+})
+
+test("the version the IDE's config.json names is the one the domain is signed with", async () => {
+  const root = join(sandbox, "versioned")
+  ideCache(root, ACCOUNT())
+  writeFileSync(join(root, "config.json"), JSON.stringify({ "cosy.core.version": "2.5.11" }))
+  const got = await _internal.lingmaDecode(root)
+  expect(got.version).toBe("2.5.11")
+  expect(_internal.lingmaSite({ name: "qoder-cn" }, HOST, got.version).cosyVersion).toBe("2.5.11")
+  // an IDE that writes no version keeps the package's own
+  const bare = join(sandbox, "bare")
+  ideCache(bare, ACCOUNT())
+  const plain = await _internal.lingmaDecode(bare)
+  expect(plain.version).toBe("")
+  expect(_internal.lingmaSite({ name: "qoder-cn" }, HOST, plain.version).cosyVersion).toBe("2.5.18")
+})
+
+test("lingma:// names a Lingma deployment outright, even where the probe answers", async () => {
+  // a 通义灵码 private deployment answers /algo/api/v1/version itself, which the
+  // probe would otherwise read as Qoder CN 2.0 and send to the device flow
+  route = (hostPath) => (hostPath.endsWith("/algo/api/v1/version") ? new Response("{}", { status: 200 }) : new Response("", { status: 404 }))
+  const qoder = await _internal.dedicatedSignIn({ name: "qoder-cn" }, "https://" + HOST)
+  expect(qoder.url).toContain("/device/selectAccounts")
+  // lingma:// goes to the IDE's cache, whatever the probe said
+  await expect(_internal.dedicatedSignIn({ name: "qoder-cn" }, "lingma://" + HOST)).rejects.toThrow(/no Lingma IDE sign-in/)
+  // and with the IDE's cache in place it signs in from it
+  ideCache(cosy, ACCOUNT())
+  const s = await _internal.dedicatedSignIn({ name: "qoder-cn" }, "lingma://" + HOST)
+  expect(s.instructions).toContain("Lingma 1.0")
+  const account = await s.callback()
+  expect(account.uid).toBe(ACCOUNT().uid)
+  expect(account.lingma).toBe(true)
 })
 
 test("the worker's cache/user opens under its machine id, beside it or at the root", async () => {
@@ -172,7 +250,7 @@ test("the IDE's own folder is found with no override", async () => {
 test("with no IDE sign-in, or a lapsed one, the sign-in says so and where it looked", async () => {
   const m = lingmaMethod(await QoderCNAuthPlugin({ client: store().client }))
   const none = await m.authorize({ dedicated: HOST }).catch((e) => e)
-  expect(none.message).toContain("no Qoder CN IDE sign-in found")
+  expect(none.message).toContain("no Lingma IDE sign-in found")
   expect(none.message).toContain(cosy)
   ideCache(cosy, ACCOUNT({ expire_time: Date.now() - 1000 }))
   await expect(m.authorize({ dedicated: HOST })).rejects.toThrow("ended")
@@ -188,7 +266,7 @@ test("a Lingma account chats on the domain's origin, signed and written as the I
   const out = await res.json()
   expect(out.choices[0].message.content).toBe("OK")
   expect(out.model).toBe("qmodel_latest")
-  expect(seen.map((x) => x.host)).toEqual([HOST])
+  expect(new Set(seen.map((x) => x.host))).toEqual(new Set([HOST]))
   const [c] = chats()
   expect(c.search).toBe("?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1")
   const h = c.headers
@@ -200,8 +278,14 @@ test("a Lingma account chats on the domain's origin, signed and written as the I
   expect(h.get("accept")).toBe("text/event-stream")
   expect(h.get("x-request-id")).toMatch(/^[0-9a-f-]{36}$/)
   const body = JSON.parse(_internal.decodeBody(c.body))
-  expect(body.session_type).toBe("assistant")
-  expect(body.business.version).toBe("2.5.18")
+  // the body is the deployment's own shape, not Qoder's: no business record,
+  // its own agent/task ids, and chat_context beside the turns
+  expect(body).toMatchObject({ chat_task: "FREE_INPUT", agent_id: "agent_chat", task_id: "common_chat", session_type: "assistant", source: 1, version: "3", is_reply: false, is_retry: false })
+  expect(body.business).toBeUndefined()
+  expect(body.image_urls).toBe(null)
+  expect(body.chat_context).toMatchObject({ localeLang: "zh", preferredLanguage: "zh", features: [], imageUrls: null })
+  expect(body.messages[0].role).toBe("system")
+  expect(typeof body.messages[0].content).toBe("string")
   expect(body.model_config).toMatchObject({ key: "qmodel_latest", format: "dashscope", source: "system" })
 })
 
@@ -255,11 +339,12 @@ test("a token near its end is renewed from the IDE's cache, never by a refresh c
   const opts = await hooks.auth.loader(s.get)
   expect((await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(ask) })).status).toBe(200)
   expect(s.auth().access).toBe("pt-Renewed00000000000000000")
-  expect(seen.map((x) => x.path)).toEqual([CHAT])
+  expect(seen.map((x) => x.path)).toEqual([_internal.LINGMA_MODELS_PATH, CHAT])
   // magpie's own renewal takes the same, and nothing while the IDE has none newer
   expect(await hooks.auth.refresh(signedIn())).toMatchObject({ access: "pt-Renewed00000000000000000" })
   expect(await hooks.auth.refresh(signedIn({ access: "pt-Renewed00000000000000000" }))).toBeUndefined()
-  expect(seen.map((x) => x.path)).toEqual([CHAT])
+  // a renewal reads the IDE's cache, never the domain
+  expect(seen.map((x) => x.path)).toEqual([_internal.LINGMA_MODELS_PATH, CHAT])
 })
 
 test("its models are the IDE's, and usage and check-in ask the domain nothing", async () => {
@@ -291,4 +376,113 @@ test("a Lingma domain's max_tokens range refusal is asked again at the ceiling i
   expect(chats().map(sentModel)).toEqual(["qmodel_latest", "qmodel_latest"])
   expect(chats().map(maxOf)).toEqual([384000, 131072])
   _internal.LEARNED_CAPS.clear()
+})
+
+// The deployment reads an image from its own file service: the chat names a
+// url that PUT /algo/api/v1... /api/v2/image/upload answered, and the envelope
+// signs that upload's body by LENGTH (getAuthSignature is handed
+// strconv.FormatInt(len, 10)), not by its bytes.
+test("a data: image goes up before the chat and is named where the deployment reads it", async () => {
+  const UPLOAD = "/algo/api/v2/image/upload"
+  const FILE = "https://files.example/vl/6b9ed704.png?signature=33a6c97b"
+  route = (at) => (at === HOST + CHAT ? sse(OK) : at === HOST + UPLOAD ? json({ result: { url: FILE }, success: true }) : new Response("", { status: 404 }))
+  const s = store(signedIn())
+  const opts = await (await QoderCNAuthPlugin({ client: s.client })).auth.loader(s.get)
+  const png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+  const chat = {
+    model: "qmodel_latest",
+    messages: [{ role: "user", content: [{ type: "text", text: "解释下图片内容" }, { type: "image_url", image_url: { url: "data:image/png;base64," + png } }] }],
+  }
+  const res = await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(chat) })
+  expect(res.status).toBe(200)
+
+  const up = seen.find((x) => x.path === UPLOAD)
+  expect(up.method).toBe("PUT")
+  expect(up.search).toMatch(/^\?request_id=[0-9a-f]{32}$/)
+  expect(up.headers.get("content-type")).toMatch(/^multipart\/form-data; boundary=[0-9a-f]{48}$/)
+  expect(up.headers.get("accept-encoding")).toBe("identity")
+  expect(up.headers.get("cosy-business-product")).toBe(null)
+  expect(up.headers.get("cosy-machineid")).toBe(MACHINE)
+  // the signature is over the body's length, on the api path without /algo
+  const [payload, sig] = up.headers.get("authorization").replace("Bearer COSY.", "").split(".")
+  const signed = createHash("md5")
+    .update(`${payload}\n${up.headers.get("cosy-key")}\n${up.headers.get("cosy-date")}\n${String(up.bodyLength)}\n${UPLOAD.slice(5)}`)
+    .digest("hex")
+  expect(sig).toBe(signed)
+
+  const body = JSON.parse(_internal.decodeBody(chats()[0].body))
+  expect(body.image_urls).toEqual([FILE])
+  expect(body.chat_context.imageUrls).toEqual([FILE])
+  // the image is named in the prompt too, by the file name its upload was given
+  expect(body.chat_prompt).toMatch(/#image:[0-9a-f]{8}\.png/)
+  expect(body.chat_prompt).toContain("#image:")
+  expect(body.chat_prompt).toContain("用户上下文:")
+  expect(body.chat_prompt).toContain("解释下图片内容")
+  expect(body.chat_context.chatPrompt).toBe(body.chat_prompt)
+  expect(body.chat_context.text).toBe("解释下图片内容\n")
+  expect(body.chat_task).toBe("FREE_INPUT")
+  expect(body.agent_id).toBe("agent_chat")
+})
+
+test("an image the chat already names by url is not uploaded again, and dataUrlBytes reads what it should", async () => {
+  expect(_internal.dataUrlBytes("https://files.example/a.png")).toBe(null)
+  const png = _internal.dataUrlBytes("data:image/png;base64,iVBORw0KGgo=")
+  expect(png.bytes.toString("base64")).toBe("iVBORw0KGgo=")
+  expect(png.name).toMatch(/^[0-9a-f]{8}\.png$/)
+  const text = _internal.dataUrlBytes("data:text/plain,hi")
+  expect(text.bytes.toString()).toBe("hi")
+  expect(text.name).toMatch(/^[0-9a-f]{8}\.plain$/)
+
+  const FILE = "https://files.example/vl/kept.png"
+  const urls = await _internal.lingmaImageUrls(
+    { api: "https://" + HOST },
+    { uid: "u", access: "t", machineId: MACHINE },
+    { messages: [{ role: "user", content: [{ type: "image_url", image_url: { url: FILE } }] }] },
+  )
+  expect(urls).toEqual([FILE])
+  expect(seen.length).toBe(0)
+})
+
+test("the deployment's own model list names the models its chat takes", async () => {
+  const MODELS = "/algo/api/v2/model/list"
+  const ORG = "org_glm-latest-coder_de64ea6840e65a7e032cb9bd383a79a3"
+  route = (at) => {
+    if (at === HOST + MODELS)
+      return json({
+        chat: [
+          { key: "default", format: "dashscope", source: "system", display_name: "qwen3", is_vl: true, max_input_tokens: 96000, order: 0 },
+          { key: ORG, format: "openai", source: "organization", display_name: "glm-latest-coder", is_vl: false, max_input_tokens: 96000, order: 5 },
+        ],
+      })
+    if (at === HOST + CHAT) return sse(OK)
+    return new Response("", { status: 404 })
+  }
+  const s = store(signedIn())
+  const opts = await (await QoderCNAuthPlugin({ client: s.client })).auth.loader(s.get)
+  // a key only the domain knows is the one its chat takes, with its own format
+  const one = { model: ORG, messages: [{ role: "user", content: "hi" }] }
+  expect((await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(one) })).status).toBe(200)
+  const body = JSON.parse(_internal.decodeBody(chats()[0].body))
+  expect(body.model_config).toMatchObject({ key: ORG, format: "openai", source: "organization", display_name: "glm-latest-coder", max_input_tokens: 96000 })
+  // asked as the IDE asks it, and remembered for the next turn
+  const list = seen.find((x) => x.path === MODELS)
+  expect(list.method).toBe("GET")
+  expect(list.headers.get("accept")).toBe("application/json")
+  expect(list.headers.get("cosy-business-product")).toBe(null)
+  await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(one) })
+  expect(seen.filter((x) => x.path === MODELS).length).toBe(1)
+})
+
+test("a deployment's reserved-looking key (default) is taken, as Qoder's own would not be", async () => {
+  const MODELS = "/algo/api/v2/model/list"
+  route = (at) => {
+    if (at === HOST + MODELS) return json({ chat: [{ key: "default", format: "dashscope", source: "system", display_name: "qwen3", is_vl: true, max_input_tokens: 96000 }] })
+    if (at === HOST + CHAT) return sse(OK)
+    return new Response("", { status: 404 })
+  }
+  const s = store(signedIn())
+  const opts = await (await QoderCNAuthPlugin({ client: s.client })).auth.loader(s.get)
+  const ask = { model: "default", messages: [{ role: "user", content: "hi" }] }
+  expect((await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(ask) })).status).toBe(200)
+  expect(JSON.parse(_internal.decodeBody(chats()[0].body)).model_config).toMatchObject({ key: "default", format: "dashscope", source: "system" })
 })
