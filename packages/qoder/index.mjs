@@ -3918,8 +3918,10 @@ const makePlugin = (site) => async ({ client }) => {
   const models = async (cred, again = false) => {
     const key = listingKey(cred)
     let l = listings.get(key)
-    // a Lingma 1.0 domain's listing names keys its chat refuses: the IDE's own
-    if (cred.lingma) return LINGMA_MODELS.map(lingmaModel)
+    // a Lingma 1.0 domain's own list is what its chat takes (the keys it
+    // names, its format and source); the IDE's three are the fallback when
+    // that list cannot be read
+    if (cred.lingma) return lingmaListing(siteOf(site, cred), cred)
     if (!l || again) {
       const s = siteOf(site, cred)
       const listing = await fetchListing(s, cred)

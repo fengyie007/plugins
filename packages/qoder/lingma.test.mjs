@@ -348,15 +348,34 @@ test("a token near its end is renewed from the IDE's cache, never by a refresh c
   expect(seen.map((x) => x.path)).toEqual([_internal.LINGMA_MODELS_PATH, CHAT])
 })
 
-test("its models are the IDE's, and usage and check-in ask the domain nothing", async () => {
+test("the models offered are the domain's own list, the IDE's three when it can't be read", async () => {
+  // the domain names its own keys
+  const ORG = "org_glm-latest-coder_de64ea6840e65a7e032cb9bd383a79a3"
+  route = (at) =>
+    at === HOST + _internal.LINGMA_MODELS_PATH
+      ? json({ chat: [
+          { key: "default", format: "dashscope", source: "system", display_name: "qwen3", is_vl: true, max_input_tokens: 96000, enable: true },
+          { key: ORG, format: "openai", source: "organization", display_name: "glm-latest-coder", is_vl: false, max_input_tokens: 96000, enable: true },
+        ] })
+      : new Response("", { status: 404 })
   const s = store(signedIn())
   const hooks = await QoderCNAuthPlugin({ client: s.client })
   const ms = await hooks.provider.models({ models: {} }, { auth: s.auth() })
-  expect(Object.keys(ms)).toEqual(["qmodel_latest", "dashscope_qmodel", "q36fmodel"])
-  expect(ms.qmodel_latest.api.url).toBe(ORIGIN)
+  expect(Object.keys(ms)).toEqual(["default", ORG])
+  expect(ms[ORG].name).toBe("glm-latest-coder")
+  expect(ms[ORG].api.url).toBe(ORIGIN)
   expect(await hooks.auth.usage(s.get)).toMatchObject({ windows: [], signIn: "kept" })
   expect((await hooks.auth.checkin(s.get)).outcome).toBe("inactive")
-  expect(seen).toEqual([])
+  expect(seen.map((x) => x.path)).toEqual([_internal.LINGMA_MODELS_PATH])
+
+  // a list that can't be read keeps the IDE's three
+  _internal.LINGMA_LISTINGS.clear()
+  seen = []
+  route = () => new Response("", { status: 404 })
+  const fallback = await QoderCNAuthPlugin({ client: store(signedIn()).client })
+  const fm = await fallback.provider.models({ models: {} }, { auth: signedIn() })
+  expect(Object.keys(fm)).toEqual(["qmodel_latest", "dashscope_qmodel", "q36fmodel"])
+  expect(fm.qmodel_latest.api.url).toBe(ORIGIN)
 })
 
 // The capture is the shape: parameters is null (the IDE leaves the model's
